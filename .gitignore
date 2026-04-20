@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Secrets / local-only config
+.env
+.env.*
+*.pem
+*.key
+credentials*
+cookies.txt
+
+# Network captures & traces — never commit these; they may contain tokens,
+# cookies, meter numbers, or other identifying data.
+*.har
+*.log
+*.pcap
+*.cap
+*.mitm
+
+# Local scratch work, debug output, and reverse-engineering notes kept outside
+# the committed tree.
+scratch/
+captured/
+debug/
+re/
+notes/private/

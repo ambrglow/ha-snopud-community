@@ -1,0 +1,12 @@
+{
+  "domain": "snopud",
+  "name": "Snohomish County PUD (Community)",
+  "version": "0.2.0",
+  "codeowners": ["@ambrglow"],
+  "config_flow": true,
+  "documentation": "https://github.com/ambrglow/ha-snopud-community",
+  "issue_tracker": "https://github.com/ambrglow/ha-snopud-community/issues",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "dependencies": ["recorder"]
+}

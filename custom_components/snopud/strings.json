@@ -1,0 +1,42 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Snohomish County PUD account",
+        "description": "Enter your MySnoPUD login. The integration will download your Green Button usage on a schedule and feed hourly readings into the Home Assistant Energy Dashboard. This is an unofficial community integration — it is not built or supported by Snohomish County PUD.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "pick_meters": {
+        "title": "Select meters",
+        "description": "Found {count} meter(s) on this account. Choose which ones to track. Retired / non-smart meters usually only report billing-interval totals; if you want that older history, enable 'Back-fill billing-interval history' in the integration's options after setup completes.",
+        "data": {
+          "meter_ids": "Meters"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password",
+      "cannot_connect": "Could not connect to my.snopud.com",
+      "no_meters_selected": "Please select at least one meter",
+      "unknown": "Unexpected error — check Home Assistant logs"
+    },
+    "abort": {
+      "already_configured": "This account is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "SnoPUD options",
+        "description": "MySnoPUD data typically lags the wall clock by 5–8 hours, so polling more often than hourly gains nothing. Pick a refresh interval that feels polite and useful.",
+        "data": {
+          "scan_interval_minutes": "Refresh interval (minutes)",
+          "enable_billing_backfill": "Back-fill billing-interval history (for retired / non-smart meters)"
+        }
+      }
+    }
+  }
+}
