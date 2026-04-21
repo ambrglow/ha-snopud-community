@@ -27,9 +27,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from datetime import datetime, timezone
+
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
+    statistics_during_period,
 )
 from homeassistant.components.recorder.util import get_instance
 from homeassistant.core import HomeAssistant
@@ -177,7 +180,151 @@ async def _last_sum_and_time(hass: HomeAssistant, statistic_id: str):
     last_start = entry.get("start")
     if last_start is None:
         return running, None
-    from datetime import datetime, timezone
     if hasattr(last_start, "tzinfo"):
         return running, last_start
     return running, datetime.fromtimestamp(float(last_start), tz=timezone.utc)
+
+
+async def async_import_billing_supplement(
+    hass: HomeAssistant,
+    *,
+    meter: "MeterInfo",
+    readings: list["IntervalReading"],
+) -> int:
+    """Retroactively merge billing-interval readings into existing LTS.
+
+    Used when a user enables ``CONF_ENABLE_BILLING_BACKFILL`` *after* a meter
+    has already had its hourly backfill run. The billing readings carry
+    timestamps strictly older than the latest existing hourly point, so
+    ``async_import_readings``'s "after-latest-only" filter would drop them.
+
+    Strategy: read every existing point for the meter, merge with the new
+    billing readings (existing points win on overlap), recompute the
+    cumulative ``sum`` from zero across the full sorted series, and re-upsert.
+    ``async_add_external_statistics`` is keyed on (statistic_id, start), so the
+    re-upsert overwrites in place without producing duplicates.
+
+    Returns the number of new billing readings written.
+    """
+    if not readings:
+        return 0
+
+    energy_id = energy_statistic_id(meter.account_number)
+    cost_id = cost_statistic_id(meter.account_number)
+
+    new_energy_by_start = {r.start: r.value_kwh for r in readings}
+    new_cost_by_start = {
+        r.start: (r.cost_cents or 0) / 100.0
+        for r in readings
+        if r.cost_cents is not None
+    }
+
+    written = await _rebuild_series_with_supplement(
+        hass,
+        statistic_id=energy_id,
+        unit=STATISTIC_UNIT_KWH,
+        name=f"SnoPUD Meter {meter.account_number} — Energy",
+        new_points_by_start=new_energy_by_start,
+    )
+
+    if new_cost_by_start:
+        await _rebuild_series_with_supplement(
+            hass,
+            statistic_id=cost_id,
+            unit=STATISTIC_UNIT_USD,
+            name=f"SnoPUD Meter {meter.account_number} — Cost",
+            new_points_by_start=new_cost_by_start,
+        )
+
+    return written
+
+
+async def _rebuild_series_with_supplement(
+    hass: HomeAssistant,
+    *,
+    statistic_id: str,
+    unit: str,
+    name: str,
+    new_points_by_start: dict,
+) -> int:
+    """Read existing stats, merge in new (older) points, recompute cumulative
+    ``sum`` from zero, upsert. Returns count of newly added points."""
+    if not new_points_by_start:
+        return 0
+
+    # Far-past start so we sweep the entire existing series. Naive datetimes
+    # aren't allowed by HA's stats API; use a tz-aware sentinel.
+    very_old = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+
+    recorder = get_instance(hass)
+    existing = await recorder.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        very_old,
+        now,
+        {statistic_id},
+        "hour",
+        None,
+        {"start", "state", "sum"},
+    )
+    rows = existing.get(statistic_id, []) or []
+
+    # Normalise existing rows into {tz-aware start: state} for merge.
+    existing_by_start: dict = {}
+    for row in rows:
+        start = row.get("start")
+        if start is None:
+            continue
+        if not hasattr(start, "tzinfo"):
+            start = datetime.fromtimestamp(float(start), tz=timezone.utc)
+        state = row.get("state")
+        if state is None:
+            continue
+        try:
+            existing_by_start[start] = float(state)
+        except (TypeError, ValueError):
+            continue
+
+    # New points only count as "new" if there isn't already a point at that
+    # exact timestamp — existing data wins on overlap, so we never overwrite
+    # finer-grain hourly numbers with coarser billing-interval ones.
+    added = 0
+    for start, value in new_points_by_start.items():
+        if start in existing_by_start:
+            continue
+        existing_by_start[start] = float(value)
+        added += 1
+
+    if added == 0:
+        _LOGGER.debug(
+            "billing supplement for %s: nothing to add (all timestamps "
+            "already present in existing series)",
+            statistic_id,
+        )
+        return 0
+
+    # Sort by start, recompute cumulative sum from zero.
+    sorted_starts = sorted(existing_by_start.keys())
+    payload = []
+    running = 0.0
+    for start in sorted_starts:
+        state = existing_by_start[start]
+        running += state
+        payload.append({"start": start, "state": state, "sum": running})
+
+    metadata = {
+        "has_mean": False,
+        "has_sum": True,
+        "name": name,
+        "source": DOMAIN,
+        "statistic_id": statistic_id,
+        "unit_of_measurement": unit,
+    }
+    _LOGGER.info(
+        "billing supplement: rebuilding %s with %d total points "
+        "(%d newly added from billing-interval feed)",
+        statistic_id, len(payload), added,
+    )
+    async_add_external_statistics(hass, metadata, payload)
+    return added

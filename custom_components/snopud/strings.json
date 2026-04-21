@@ -31,7 +31,7 @@
     "step": {
       "init": {
         "title": "SnoPUD options",
-        "description": "MySnoPUD data typically lags the wall clock by 5–8 hours, so polling more often than hourly gains nothing. The initial backfill setting only takes effect on first setup of each meter — once a meter has been backfilled, changing this won't re-run the import.",
+        "description": "MySnoPUD data typically lags the wall clock by 5–8 hours, so polling more often than hourly gains nothing. The hourly backfill window only takes effect on first setup of each meter — raising it later won't retroactively fetch older hourly history. The billing-interval backfill toggle, by contrast, can be switched on at any time: enabling it kicks off a one-shot retroactive billing import on the next refresh for any selected meter that hasn't already had one.",
         "data": {
           "scan_interval_minutes": "Refresh interval (minutes)",
           "backfill_days": "Initial hourly backfill window (days)",

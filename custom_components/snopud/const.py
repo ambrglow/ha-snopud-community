@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 DOMAIN = "snopud"
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 # Integration config keys (entry.data)
 CONF_EMAIL = "email"
@@ -16,6 +16,11 @@ CONF_SCAN_INTERVAL_MINUTES = "scan_interval_minutes"
 CONF_ENABLE_BILLING_BACKFILL = "enable_billing_backfill"
 CONF_BACKFILL_DAYS = "backfill_days"
 CONF_BACKFILLED_METERS = "backfilled_meters"  # list[str] persisted across restarts
+# Meters that have had a successful one-shot billing-interval import. Tracked
+# independently of CONF_BACKFILLED_METERS so a user can enable the
+# billing-backfill option *after* a meter has already had its hourly backfill
+# and still get a one-time retroactive billing import.
+CONF_BILLING_BACKFILLED_METERS = "billing_backfilled_meters"
 
 # URLs
 BASE_URL = "https://my.snopud.com"

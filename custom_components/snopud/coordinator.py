@@ -12,9 +12,13 @@ meter on **two parallel grains**:
   meter actually reports.
 
 On first run for each meter we additionally perform a chunked hourly backfill
-covering up to ``CONF_BACKFILL_DAYS`` (default 730), and — if the user has
-opted in via ``CONF_ENABLE_BILLING_BACKFILL`` — a billing-interval backfill
-for retired non-smart meters that predate the smart-meter upgrade.
+covering up to ``CONF_BACKFILL_DAYS`` (default 730). Independently, if
+``CONF_ENABLE_BILLING_BACKFILL`` is enabled — either at initial setup or
+switched on later via the options flow — we perform a one-shot chunked
+billing-interval backfill for retired non-smart meters that predate the
+smart-meter upgrade. Billing-backfill state is tracked per-meter in
+``entry.options[CONF_BILLING_BACKFILLED_METERS]`` separately from the hourly
+backfill so enabling the option post-setup actually triggers the import.
 
 To survive Home Assistant restarts without producing a sawtooth in the
 sensor's monotonic ``cumulative_kwh`` value, we seed the in-process
@@ -22,8 +26,9 @@ cumulative counters from the last persisted long-term-statistics ``sum`` for
 each meter on the first successful update after construction. This keeps the
 ``total_increasing`` sensor monotonically increasing across restarts.
 
-Meters that have already been backfilled are tracked in ``entry.options`` so
-repeat backfills don't happen on every restart.
+Meters that have already been backfilled (hourly and/or billing-interval)
+are tracked in ``entry.options`` so repeat backfills don't happen on every
+restart.
 """
 from __future__ import annotations
 
@@ -41,6 +46,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import (
     CONF_BACKFILL_DAYS,
     CONF_BACKFILLED_METERS,
+    CONF_BILLING_BACKFILLED_METERS,
     CONF_ENABLE_BILLING_BACKFILL,
     CONF_SCAN_INTERVAL_MINUTES,
     DEFAULT_BACKFILL_DAYS,
@@ -65,6 +71,7 @@ from .snopud_client import (
     SnoPUDError,
 )
 from .statistics import (
+    async_import_billing_supplement,
     async_import_readings,
     energy_statistic_id,
     cost_statistic_id,
@@ -122,6 +129,12 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # from entry.options so a restart doesn't repeat the full backfill.
         persisted = entry.options.get(CONF_BACKFILLED_METERS, [])
         self._backfilled: set[str] = set(persisted)
+        # Independent cache of meters that have had a one-shot billing-interval
+        # supplement run. Tracked separately so enabling the billing-backfill
+        # option *after* setup still triggers the retroactive import for any
+        # meter that hasn't had it yet.
+        persisted_billing = entry.options.get(CONF_BILLING_BACKFILLED_METERS, [])
+        self._billing_backfilled: set[str] = set(persisted_billing)
         # Cumulative kWh/USD per meter. We *seed* these from
         # get_last_statistics on the first successful update per meter so that
         # the sensor's TOTAL_INCREASING value continues monotonically across
@@ -144,11 +157,17 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Re-read options from the config entry and apply them live.
 
         Called from the integration's options-update listener so users can
-        change settings without a full Home Assistant restart. Note: changes
-        to ``backfill_days`` only affect *new* backfills — once a meter is
-        marked as backfilled, the coordinator won't repeat the operation.
-        Re-running a backfill requires removing and re-adding the integration
-        (and deleting the per-meter statistics in Developer Tools).
+        change settings without a full Home Assistant restart.
+
+        * ``scan_interval_minutes`` — applied to the coordinator's update
+          interval immediately.
+        * ``backfill_days`` — read fresh at the start of each hourly-backfill
+          attempt; doesn't retroactively re-import history for a meter that's
+          already been backfilled.
+        * ``enable_billing_backfill`` — takes effect on the very next
+          coordinator refresh: any configured meter that hasn't had a billing
+          supplement run yet will get one. Flipping this off again does
+          nothing to already-imported billing data.
         """
         new_interval = _resolve_scan_interval(self._entry)
         if new_interval != self.update_interval:
@@ -157,8 +176,8 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 new_interval,
             )
             self.update_interval = new_interval
-        # Backfill-days changes don't need to do anything at runtime; they
-        # are read fresh from options at the start of each backfill attempt.
+        # The billing-backfill toggle and backfill-days knob are read fresh on
+        # the next refresh — no state to mutate here.
 
     async def _persist_backfilled(self) -> None:
         """Persist the set of already-backfilled meters into entry.options."""
@@ -168,6 +187,23 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         new_options = {**self._entry.options, CONF_BACKFILLED_METERS: new}
         self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+
+    async def _persist_billing_backfilled(self) -> None:
+        """Persist the set of meters that have had billing supplement run."""
+        current = self._entry.options.get(CONF_BILLING_BACKFILLED_METERS, [])
+        new = sorted(self._billing_backfilled)
+        if sorted(current) == new:
+            return
+        new_options = {**self._entry.options, CONF_BILLING_BACKFILLED_METERS: new}
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+
+    async def _reseed_cumulative_from_stats(self, account_number: str) -> None:
+        """Force-refresh the in-process cumulative counters from persisted
+        stats, even if we've already seeded once. Used after a retroactive
+        billing supplement, which changes the persisted ``sum`` for prior
+        rows and would otherwise leave the in-process counter stale."""
+        self._cumulative_seeded.discard(account_number)
+        await self._seed_cumulative_from_stats(account_number)
 
     async def _seed_cumulative_from_stats(self, account_number: str) -> None:
         """Restart-sawtooth fix: load the most recent persisted statistics
@@ -279,6 +315,22 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         readings=hourly_feed.readings,
                     )
 
+                # === Billing-interval supplement (one-shot per meter) ===
+                # Runs only when the option is enabled and this meter hasn't
+                # had the supplement yet. Handles both the "enabled at initial
+                # setup" case and the "enabled later from the options flow"
+                # case, so a user can switch it on at any time.
+                try:
+                    billing_added = await self._run_billing_supplement_if_needed(
+                        client, meter, all_meters, today, hourly_feed,
+                    )
+                except Exception as err:  # noqa: BLE001 — never fail whole refresh
+                    _LOGGER.warning(
+                        "billing-interval supplement raised for meter %s: %s",
+                        meter.account_number, err,
+                    )
+                    billing_added = 0
+
                 # === 15-min path → sensor state ===
                 try:
                     sensor_feed = await self._fetch_sensor_for_meter(
@@ -310,6 +362,7 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "rate_schedule": meter.rate_schedule,
                     "hourly_reading_count": len(hourly_feed.readings),
                     "sensor_reading_count": len(sensor_feed.readings),
+                    "billing_supplement_added": billing_added,
                     "latest_reading": last.start.isoformat() if last else None,
                     "latest_reading_kwh": last.value_kwh if last else None,
                     "latest_reading_cost": (
@@ -326,6 +379,7 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Persist backfill state after a successful update cycle.
         await self._persist_backfilled()
+        await self._persist_billing_backfilled()
         return result
 
     def _advance_cumulative(
@@ -368,7 +422,14 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         all_meters: list[MeterInfo],
         today: date,
     ) -> GreenButtonFeed:
-        """Hourly fetch — used for long-term statistics + initial backfill."""
+        """Hourly fetch — used for long-term statistics + initial backfill.
+
+        Billing-interval backfill is handled separately in
+        :meth:`_run_billing_supplement_if_needed`, gated on the
+        ``enable_billing_backfill`` option and a per-meter
+        ``_billing_backfilled`` flag. This split is what makes "enable
+        billing-backfill after the initial setup" actually work.
+        """
         if meter.account_number not in self._backfilled:
             backfill_days = _resolve_backfill_days(self._entry)
             _LOGGER.info(
@@ -381,42 +442,6 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 interval=DEFAULT_STATISTICS_INTERVAL,
                 total_days=backfill_days,
             )
-
-            # Optional: if the account also has pre-smart-meter history that
-            # the hourly interval can't reach, retry at billing interval.
-            if self._entry.options.get(CONF_ENABLE_BILLING_BACKFILL, False):
-                earliest_hourly = (
-                    min(r.start for r in merged.readings).date()
-                    if merged.readings
-                    else today
-                )
-                billing_end = earliest_hourly - timedelta(days=1)
-                if billing_end > today - timedelta(days=backfill_days):
-                    _LOGGER.info(
-                        "attempting billing-interval backfill for meter %s through %s",
-                        meter.account_number,
-                        billing_end,
-                    )
-                    billing = await self._chunked_backfill(
-                        client, meter, all_meters, billing_end,
-                        interval=INTERVAL_BILLING,
-                        total_days=backfill_days,
-                    )
-                    combined = list(merged.readings) + list(billing.readings)
-                    seen: set[float] = set()
-                    deduped: list[IntervalReading] = []
-                    for r in sorted(combined, key=lambda x: x.start):
-                        ts = r.start.timestamp()
-                        if ts in seen:
-                            continue
-                        seen.add(ts)
-                        deduped.append(r)
-                    merged = GreenButtonFeed(
-                        reading_type=merged.reading_type or billing.reading_type,
-                        readings=deduped,
-                        usage_point_id=merged.usage_point_id or billing.usage_point_id,
-                    )
-
             self._backfilled.add(meter.account_number)
             return merged
 
@@ -431,6 +456,87 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             interval=DEFAULT_STATISTICS_INTERVAL,
         )
         return parse_green_button(xml)
+
+    async def _run_billing_supplement_if_needed(
+        self,
+        client: SnoPUDClient,
+        meter: MeterInfo,
+        all_meters: list[MeterInfo],
+        today: date,
+        hourly_feed: GreenButtonFeed,
+    ) -> int:
+        """One-shot retroactive billing-interval import for a meter.
+
+        Runs at most once per meter per config entry, gated on:
+        * ``CONF_ENABLE_BILLING_BACKFILL`` being true on the config entry, and
+        * the meter not already being in ``self._billing_backfilled``.
+
+        Returns the number of new billing-interval rows that were written
+        (zero on no-op or empty response).
+        """
+        if not self._entry.options.get(CONF_ENABLE_BILLING_BACKFILL, False):
+            return 0
+        if meter.account_number in self._billing_backfilled:
+            return 0
+
+        backfill_days = _resolve_backfill_days(self._entry)
+        # Ask only for the slice strictly older than the earliest hourly point
+        # we have for this meter — billing-interval rows older than that fill
+        # in pre-smart-meter history; rows newer than that would just collide
+        # with the finer-grain hourly series we already have.
+        earliest_hourly = (
+            min(r.start for r in hourly_feed.readings).date()
+            if hourly_feed.readings
+            else today
+        )
+        billing_end = earliest_hourly - timedelta(days=1)
+        oldest_window = today - timedelta(days=backfill_days)
+        if billing_end <= oldest_window:
+            # No room for a billing slice older than the hourly window —
+            # nothing to fetch. Mark done so we don't re-attempt every cycle.
+            self._billing_backfilled.add(meter.account_number)
+            return 0
+
+        _LOGGER.info(
+            "running one-shot billing-interval supplement for meter %s "
+            "through %s",
+            meter.account_number, billing_end,
+        )
+        try:
+            billing = await self._chunked_backfill(
+                client, meter, all_meters, billing_end,
+                interval=INTERVAL_BILLING,
+                total_days=backfill_days,
+            )
+        except SnoPUDDownloadError as err:
+            _LOGGER.warning(
+                "billing-interval supplement failed for meter %s: %s "
+                "(will retry on next refresh)",
+                meter.account_number, err,
+            )
+            return 0
+
+        if not billing.readings:
+            _LOGGER.info(
+                "billing supplement for meter %s returned no readings — "
+                "marking complete so we don't keep retrying",
+                meter.account_number,
+            )
+            self._billing_backfilled.add(meter.account_number)
+            return 0
+
+        added = await async_import_billing_supplement(
+            self.hass,
+            meter=meter,
+            readings=billing.readings,
+        )
+        if added > 0:
+            # The persisted statistics ``sum`` for this meter has been
+            # rebuilt from zero; refresh the in-process cumulative counter so
+            # the sensor's TOTAL_INCREASING value reflects the new total.
+            await self._reseed_cumulative_from_stats(meter.account_number)
+        self._billing_backfilled.add(meter.account_number)
+        return added
 
     async def _fetch_sensor_for_meter(
         self,

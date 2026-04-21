@@ -154,7 +154,12 @@ Open **Settings → Devices & Services → SnoPUD → Configure** to change:
 - **Back-fill billing-interval history.** Enable this when your account has
   a pre-smart-meter period you want to import. The integration will request
   monthly billing-interval totals for any date range the hourly feed
-  couldn't reach.
+  couldn't reach. This works **at any point**, not only at initial setup —
+  switching the option on later kicks off a one-shot retroactive billing
+  import on the next refresh for any selected meter that hasn't had a
+  billing supplement yet. Once a meter has had its billing supplement run,
+  the integration won't repeat it on every refresh; switching the option
+  off afterwards does not erase already-imported billing data.
 
 All three options are applied live — no Home Assistant restart needed.
 
@@ -192,10 +197,16 @@ week" questions than adding separate sensors here.
    seeding the cumulative counter from the persisted long-term statistics
    on the first update after each restart.
 
-If the configured meter is a retired non-smart meter that doesn't expose
-hourly data, and you've enabled the "Back-fill billing-interval history"
-option, the integration retries the historical fetch at
-`SelectedInterval=7` (billing) to capture the older monthly totals.
+If you enable the "Back-fill billing-interval history" option — either at
+setup or later from the integration's Configure menu — the integration
+performs a **one-shot** billing-interval fetch (`SelectedInterval=7`) for
+each configured meter that hasn't had a billing supplement yet, covering
+the range strictly older than that meter's earliest hourly reading. The
+billing rows are merged into the existing long-term-statistics series, and
+the cumulative `sum` is recomputed across the full timeline so the Energy
+Dashboard's totals stay coherent. Each meter's billing-supplement state is
+remembered in the config entry's options so the supplement isn't repeated
+on every refresh.
 
 ## Known limits & retention notes
 
@@ -258,7 +269,15 @@ Common failure modes:
 
 ## Re-running the backfill
 
-If you want to wipe and re-import history:
+If you just want to pull older **billing-interval** history for a meter
+that's already on your account, you don't need to delete anything — open
+Settings → Devices & Services → SnoPUD → Configure and turn on "Back-fill
+billing-interval history." The next refresh will run a one-shot retroactive
+import for any meter that hasn't already had one.
+
+If you want to wipe and re-import **all** history from scratch — e.g. to
+apply a longer `backfill_days` window to a meter that's already been
+backfilled, or because the existing series has drifted — do this:
 
 1. Remove the integration (Settings → Devices & Services → SnoPUD → ⋮ → Delete).
 2. In **Developer Tools → Statistics**, find each `snopud:...` series and
