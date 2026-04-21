@@ -1,19 +1,26 @@
 """Import parsed Green Button readings into Home Assistant's long-term statistics.
 
-The ESPI readings from MySnoPUD are **delta** (Wh consumed during each interval,
-plus optional currency cost). Home Assistant's Energy Dashboard expects a
-``total_increasing`` metered value (cumulative kWh that grows monotonically
-except on meter replacement). We compute a running cumulative sum per meter.
+This module handles the **hourly** leg of the coordinator's dual-path fetch:
+the hourly Green Button feed is written into HA's long-term statistics so the
+Energy Dashboard can consume it directly.
 
-We write via ``async_add_external_statistics`` rather than creating a real
-sensor because the data is historical and irregularly updated; HA's statistics
-API supports retroactive writes and idempotent upserts keyed on
-(statistic_id, start).
+The ESPI readings from MySnoPUD are **delta** (Wh consumed during each
+interval, plus optional currency cost). The Energy Dashboard wants a
+``total_increasing`` metered value (cumulative kWh that grows monotonically
+except on meter replacement), so we compute a running cumulative sum per
+meter and persist that as the ``sum`` field of each statistic row.
+
+We write via ``async_add_external_statistics`` rather than relying on a real
+sensor's auto-generated LTS because the data is historical and irregularly
+updated; HA's statistics API supports retroactive writes and idempotent
+upserts keyed on (statistic_id, start).
 
 The statistics API requires hour-aligned timestamps (``minute==second==0``),
-so we request hourly data from the portal by default. Readings whose start
-isn't aligned (e.g. billing-interval backfill for retired meters) are still
-imported — HA will reject any that don't align and log a warning we'll catch.
+which is why the coordinator requests the hourly interval on this path.
+Billing-interval backfill readings (which align on month boundaries and are
+also hour-aligned) work too. The parallel 15-minute sensor path is *not*
+imported here — it is surfaced as sensor state by ``sensor.py`` and kept by
+HA's recorder on whatever retention the user configures.
 """
 from __future__ import annotations
 
@@ -36,15 +43,24 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
-def _energy_statistic_id(meter_account_number: str) -> str:
-    # External statistic IDs for custom integrations must be prefixed with the
-    # integration domain + ':'. The second half becomes the visible series name
-    # in the Energy Dashboard.
+def energy_statistic_id(meter_account_number: str) -> str:
+    """External statistic ID for a meter's kWh series.
+
+    External statistic IDs for custom integrations must be prefixed with the
+    integration domain + ':'. The second half becomes the visible series name
+    in the Energy Dashboard.
+    """
     return f"{DOMAIN}:energy_consumption_{meter_account_number}"
 
 
-def _cost_statistic_id(meter_account_number: str) -> str:
+def cost_statistic_id(meter_account_number: str) -> str:
+    """External statistic ID for a meter's USD cost series."""
     return f"{DOMAIN}:energy_cost_{meter_account_number}"
+
+
+# Backwards-compatible private aliases so older internal references keep working.
+_energy_statistic_id = energy_statistic_id
+_cost_statistic_id = cost_statistic_id
 
 
 async def async_import_readings(
@@ -67,8 +83,8 @@ async def async_import_readings(
     if not readings:
         return
 
-    energy_id = _energy_statistic_id(meter.account_number)
-    cost_id = _cost_statistic_id(meter.account_number)
+    energy_id = energy_statistic_id(meter.account_number)
+    cost_id = cost_statistic_id(meter.account_number)
 
     # Continue cumulative sums from the last known point for each series.
     energy_running, energy_last_dt = await _last_sum_and_time(hass, energy_id)

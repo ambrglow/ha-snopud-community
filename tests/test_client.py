@@ -135,6 +135,25 @@ def test_build_download_form_with_billing_interval() -> None:
     print("✓ billing-interval override round-trips")
 
 
+def test_build_download_form_with_fifteen_min_interval() -> None:
+    """Pin the 15-minute sensor-entity path: the coordinator fetches both
+    hourly (for LTS) and 15-min (for the sensor) on every refresh."""
+    meters = [MeterInfo("1000000001", "9000001", "Electric", "Residential Schedule 7")]
+    body = SnoPUDClient._build_download_form(
+        token="TEST_TOKEN",
+        meters=meters,
+        target_internal_id="9000001",
+        start=date(2026, 4, 15),
+        end=date(2026, 4, 18),
+        interval="3",  # INTERVAL_15MIN
+    )
+    pairs = dict(parse_qsl(body, keep_blank_values=True))
+    assert pairs["SelectedInterval"] == "3", (
+        f"expected 15-min interval '3', got {pairs['SelectedInterval']!r}"
+    )
+    print("✓ 15-minute sensor-path interval round-trips")
+
+
 def test_default_user_agent_is_honest() -> None:
     # User-Agent must identify the integration, not spoof a browser.
     client = SnoPUDClient.__new__(SnoPUDClient)
@@ -157,5 +176,6 @@ if __name__ == "__main__":
     test_parse_meters()
     test_build_download_form_single_meter_selected()
     test_build_download_form_with_billing_interval()
+    test_build_download_form_with_fifteen_min_interval()
     test_default_user_agent_is_honest()
     print("\nall client tests passed")

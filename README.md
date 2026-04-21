@@ -46,23 +46,36 @@ This code is provided as-is under the MIT License with no warranty. If SnoPUD
 or Aclara requests changes or removal, please [open an issue][issues] — the
 maintainer will act in good faith.
 
-Credentials are stored in Home Assistant's config entry on your own device,
-encrypted at rest by HA. They are never transmitted anywhere except to
-`my.snopud.com` during normal authentication. This repository contains no
-account data, usage data, or credentials.
+Credentials are stored in Home Assistant's config entry on your own device.
+They are never transmitted anywhere except to `my.snopud.com` during normal
+authentication. Home Assistant does not by default encrypt config entries at
+rest — they live in `<config>/.storage/core.config_entries` as readable JSON —
+so treat the whole HA config directory like any other secret store: keep it
+on an encrypted disk, back it up privately, use a strong unique MySnoPUD
+password, and enable MFA on any account that supports it. This repository
+itself contains no account data, usage data, or credentials.
 
 ## Features
 
-- Hourly interval data, written into HA's long-term statistics so the Energy
-  Dashboard can display it directly.
-- Optional 15-minute-grain sensor entity (one per meter) for real-time
-  dashboards and automations.
+- **Dual-grain fetch** on every refresh:
+  - Hourly Green Button data is written into HA's long-term statistics so the
+    Energy Dashboard can display it directly.
+  - 15-minute Green Button data drives a sensor entity (one per meter) for
+    Lovelace cards and automations at the granularity the meter actually
+    reports.
 - Optional cost series (USD), when SnoPUD includes a `cost` column in the
   export — no tariff configuration required on the HA side.
-- Initial backfill of up to 2 years of hourly history on first setup.
+- Initial hourly backfill on first setup (default 2 years; configurable from
+  7 days up to 5 years via the options flow).
 - Optional billing-interval backfill for older retired / non-smart meters
   that predate your smart-meter upgrade.
 - Configurable refresh interval (15 min – 12 h; default 1 h).
+- Live-applied options — refresh interval, backfill window, and
+  billing-interval backfill toggle all take effect without restarting Home
+  Assistant.
+- Cumulative kWh counters seeded from persisted statistics on every HA
+  restart, so the sensor's `total_increasing` value continues monotonically
+  rather than producing a sawtooth.
 - Multiple meters per account supported.
 
 ## Install
@@ -112,16 +125,38 @@ Go to **Settings → Dashboards → Energy** and add the energy series as a grid
 consumption source; add the cost series under "Costs" if you want the dollar
 view.
 
+It also creates one **sensor entity** per meter, named like:
+
+```
+sensor.snopud_meter_1000000001_energy
+```
+
+The sensor's state is a cumulative-kWh counter (`state_class=total_increasing`),
+fed by 15-minute Green Button readings. Use it for Lovelace cards, the
+Statistics or Statistics-Graph helpers, and automations. The `latest_reading_*`
+attributes carry the most recent 15-minute slice for automations that want a
+"what just happened" trigger.
+
+You can point the Energy Dashboard at *either* the external statistic or the
+sensor — the external statistic is the canonical, idempotently-upserted feed
+and is what we recommend.
+
 ### Options (adjustable after setup)
 
 Open **Settings → Devices & Services → SnoPUD → Configure** to change:
 
 - **Refresh interval** (15 min – 12 h, default 1 h). SnoPUD's data lags the
   wall clock by ~5–8 hours, so more frequent polling gains nothing real.
+- **Initial hourly backfill window** (7 days – 5 years, default 730 days).
+  Only takes effect on the *first* import of a given meter — once a meter
+  has been backfilled, raising this won't pull older history. To re-run a
+  backfill, see "Re-running the backfill" below.
 - **Back-fill billing-interval history.** Enable this when your account has
   a pre-smart-meter period you want to import. The integration will request
   monthly billing-interval totals for any date range the hourly feed
   couldn't reach.
+
+All three options are applied live — no Home Assistant restart needed.
 
 ## Getting daily / weekly / monthly totals
 
@@ -138,32 +173,64 @@ week" questions than adding separate sensors here.
    a cookie-based session).
 2. Calls `/Usage/InitializeDownloadSettings` to enumerate meters and harvest
    the CSRF token the portal's own download form uses.
-3. Calls `/Usage/Download` with the same form body the portal's download
-   button submits: `SelectedFormat=1` (Green Button XML), `SelectedInterval`
-   = hourly (or billing, for the retired-meter path), `SelectedUsageType=1`
-   (kWh consumption), and a `Start`/`End` date range.
-4. Parses the returned Atom feed's `IntervalReading` entries into kWh deltas
-   (plus optional cost in USD).
-5. Writes the cumulative sum as an external statistic via
-   `async_add_external_statistics`.
+3. For each configured meter, performs **two** Green Button downloads per
+   refresh cycle:
+   - `SelectedInterval=5` (hourly) for the long-term-statistics feed,
+     covering either the configured backfill window on first run or the
+     last few days incrementally thereafter.
+   - `SelectedInterval=3` (15-minute) for the sensor entity, covering a
+     short rolling lookback so dashboards stay current.
+   Both calls submit the same body shape as the portal's own download form:
+   `SelectedFormat=1` (Green Button XML), `SelectedUsageType=1` (kWh
+   consumption), plus the requested `Start`/`End` date range.
+4. Parses each returned Atom feed's `IntervalReading` entries into kWh
+   deltas (plus optional cost in USD).
+5. Writes the hourly readings into HA's recorder via
+   `async_add_external_statistics` (idempotent upsert keyed on
+   `(statistic_id, start)`).
+6. Updates the sensor's cumulative-kWh state from the 15-minute readings,
+   seeding the cumulative counter from the persisted long-term statistics
+   on the first update after each restart.
 
-## Known limits
+If the configured meter is a retired non-smart meter that doesn't expose
+hourly data, and you've enabled the "Back-fill billing-interval history"
+option, the integration retries the historical fetch at
+`SelectedInterval=7` (billing) to capture the older monthly totals.
+
+## Known limits & retention notes
 
 - **~5–8 hour data lag.** MySnoPUD's data appears in the portal several hours
   behind wall clock. Afternoon readings typically show up the same evening.
   The Energy Dashboard will show "today" as partial until then.
-- **Hourly resolution in HA's long-term statistics.** HA's external-statistics
-  API requires hour-aligned timestamps, so sub-hourly resolution isn't kept
-  in long-term storage. The optional 15-min sensor entity preserves the
-  finer grain in short-term history (typically 10 days).
+- **Retention, in plain English.** Home Assistant keeps two kinds of
+  history, and this integration uses both:
+  1. **Long-term statistics** are kept indefinitely (they're the series
+     behind the Energy Dashboard). The integration writes the hourly feed
+     straight into LTS as `snopud:energy_consumption_<account>` (and
+     `snopud:energy_cost_<account>` when cost is available). Once imported,
+     those points are retained forever.
+  2. **Sensor state history** (the 15-minute readings published by
+     `sensor.snopud_meter_<account>_energy`) is kept by HA's **recorder**,
+     which by default purges state history older than `purge_keep_days`
+     (10 days). HA's recorder also *auto-generates* hourly long-term
+     aggregates from any sensor with `state_class=total_increasing`, so the
+     hourly shape of the 15-minute series is retained forever even after
+     the raw 15-minute state rows are purged. If you want raw 15-minute
+     state kept forever like a temperature sensor, raise
+     `recorder:` / `purge_keep_days` in `configuration.yaml`, or mirror the
+     sensor out to an external timeseries store (InfluxDB, TimescaleDB, etc.)
+     using HA's existing integrations. The SnoPUD integration can't change
+     HA's recorder retention from its own config.
 - **Max download window.** Empirical; the integration defaults to 90-day
   chunks. If you hit errors on backfill, lower `MAX_DOWNLOAD_WINDOW_DAYS` in
   `const.py`.
 - **MFA / security questions not supported.** The integration assumes a plain
   email + password login. If MySnoPUD ever requires a second factor and you
   have it enabled, login will fail.
-- **Credentials stored in the config entry.** Same as most HA cloud
-  integrations. Use a strong password that isn't reused anywhere.
+- **Credentials stored in the config entry.** Home Assistant does not
+  encrypt config entries at rest — they live in plain JSON inside your HA
+  config directory. Keep HA's config directory on an encrypted disk and use
+  a strong, unique MySnoPUD password.
 - **Retired meters.** If your account has an old non-smart meter that was
   replaced, both will appear in the meter picker. The retired one only
   reports billing-interval totals — enable the "back-fill billing-interval

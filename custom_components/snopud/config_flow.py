@@ -22,12 +22,16 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    CONF_BACKFILL_DAYS,
     CONF_ENABLE_BILLING_BACKFILL,
     CONF_METER_IDS,
     CONF_SCAN_INTERVAL_MINUTES,
+    DEFAULT_BACKFILL_DAYS,
     DEFAULT_SCAN_INTERVAL_MINUTES,
     DOMAIN,
+    MAX_BACKFILL_DAYS,
     MAX_SCAN_INTERVAL_MINUTES,
+    MIN_BACKFILL_DAYS,
     MIN_SCAN_INTERVAL_MINUTES,
 )
 from .snopud_client import (
@@ -141,8 +145,11 @@ class SnoPUDConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @callback
     def _create_entry(self, meter_account_numbers: list[str]) -> FlowResult:
         assert self._email is not None and self._password is not None
+        # Title intentionally does not embed the user's email: config-entry
+        # titles appear in screenshots, notifications, and log lines, and the
+        # email is already stored in entry.data for the integration's own use.
         return self.async_create_entry(
-            title=f"SnoPUD ({self._email})",
+            title="SnoPUD (Community)",
             data={
                 CONF_EMAIL: self._email,
                 CONF_PASSWORD: self._password,
@@ -151,6 +158,7 @@ class SnoPUDConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             options={
                 CONF_SCAN_INTERVAL_MINUTES: DEFAULT_SCAN_INTERVAL_MINUTES,
                 CONF_ENABLE_BILLING_BACKFILL: False,
+                CONF_BACKFILL_DAYS: DEFAULT_BACKFILL_DAYS,
             },
         )
 
@@ -191,23 +199,26 @@ class SnoPUDOptionsFlow(config_entries.OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         if user_input is not None:
-            return self.async_create_entry(
-                title="",
-                data={
-                    CONF_SCAN_INTERVAL_MINUTES: int(
-                        user_input[CONF_SCAN_INTERVAL_MINUTES]
-                    ),
-                    CONF_ENABLE_BILLING_BACKFILL: bool(
-                        user_input[CONF_ENABLE_BILLING_BACKFILL]
-                    ),
-                },
+            # Preserve any options we don't surface in the form (e.g.
+            # CONF_BACKFILLED_METERS, which tracks per-meter backfill state).
+            merged = {**self._entry.options}
+            merged[CONF_SCAN_INTERVAL_MINUTES] = int(
+                user_input[CONF_SCAN_INTERVAL_MINUTES]
             )
+            merged[CONF_ENABLE_BILLING_BACKFILL] = bool(
+                user_input[CONF_ENABLE_BILLING_BACKFILL]
+            )
+            merged[CONF_BACKFILL_DAYS] = int(user_input[CONF_BACKFILL_DAYS])
+            return self.async_create_entry(title="", data=merged)
 
         current_minutes = self._entry.options.get(
             CONF_SCAN_INTERVAL_MINUTES, DEFAULT_SCAN_INTERVAL_MINUTES
         )
         current_billing = self._entry.options.get(
             CONF_ENABLE_BILLING_BACKFILL, False
+        )
+        current_backfill_days = self._entry.options.get(
+            CONF_BACKFILL_DAYS, DEFAULT_BACKFILL_DAYS
         )
         schema = vol.Schema(
             {
@@ -221,6 +232,18 @@ class SnoPUDOptionsFlow(config_entries.OptionsFlow):
                         step=15,
                         mode=NumberSelectorMode.SLIDER,
                         unit_of_measurement="min",
+                    )
+                ),
+                vol.Required(
+                    CONF_BACKFILL_DAYS,
+                    default=current_backfill_days,
+                ): NumberSelector(
+                    NumberSelectorConfig(
+                        min=MIN_BACKFILL_DAYS,
+                        max=MAX_BACKFILL_DAYS,
+                        step=1,
+                        mode=NumberSelectorMode.BOX,
+                        unit_of_measurement="days",
                     )
                 ),
                 vol.Required(

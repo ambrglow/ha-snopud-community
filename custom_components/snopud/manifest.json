@@ -1,7 +1,7 @@
 {
   "domain": "snopud",
   "name": "Snohomish County PUD (Community)",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "codeowners": ["@ambrglow"],
   "config_flow": true,
   "documentation": "https://github.com/ambrglow/ha-snopud-community",
