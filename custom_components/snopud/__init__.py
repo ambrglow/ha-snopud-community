@@ -33,8 +33,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # React to options changes (scan interval, billing backfill toggle)
-    # without requiring a full HA restart or integration reload.
+    # React to options changes (scan interval, initial backfill window,
+    # billing-interval backfill toggle) without requiring a full HA restart
+    # or integration reload.
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
     return True
