@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 DOMAIN = "snopud"
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 # Integration config keys (entry.data)
 CONF_EMAIL = "email"
@@ -21,6 +21,10 @@ CONF_BACKFILLED_METERS = "backfilled_meters"  # list[str] persisted across resta
 # billing-backfill option *after* a meter has already had its hourly backfill
 # and still get a one-time retroactive billing import.
 CONF_BILLING_BACKFILLED_METERS = "billing_backfilled_meters"
+# Tracks the value of CONF_BACKFILL_DAYS the coordinator last honored, so that
+# raising the option later can trigger a re-import of the newly-uncovered
+# range. Lowering it does nothing destructive — it just records the new value.
+CONF_LAST_APPLIED_BACKFILL_DAYS = "last_applied_backfill_days"
 
 # URLs
 BASE_URL = "https://my.snopud.com"

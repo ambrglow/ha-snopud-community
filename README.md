@@ -148,9 +148,15 @@ Open **Settings → Devices & Services → SnoPUD → Configure** to change:
 - **Refresh interval** (15 min – 12 h, default 1 h). SnoPUD's data lags the
   wall clock by ~5–8 hours, so more frequent polling gains nothing real.
 - **Initial hourly backfill window** (7 days – 5 years, default 730 days).
-  Only takes effect on the *first* import of a given meter — once a meter
-  has been backfilled, raising this won't pull older history. To re-run a
-  backfill, see "Re-running the backfill" below.
+  On initial import for a meter, the integration fetches hourly Green
+  Button data for this many days of history (subject to what SnoPUD's
+  portal actually exposes — empirically the portal caps hourly detail at
+  about 2 years regardless of what you request). If you raise this value
+  later, the next refresh will re-run the import to cover the widened
+  window — useful for pairing with billing-interval backfill, since
+  raising the window also re-runs the billing supplement so it can reach
+  farther back than it did the first time. Lowering the value is a no-op:
+  already-imported history is left alone.
 - **Back-fill billing-interval history.** Enable this when your account has
   a pre-smart-meter period you want to import. The integration will request
   monthly billing-interval totals for any date range the hourly feed
@@ -213,6 +219,12 @@ on every refresh.
 - **~5–8 hour data lag.** MySnoPUD's data appears in the portal several hours
   behind wall clock. Afternoon readings typically show up the same evening.
   The Energy Dashboard will show "today" as partial until then.
+- **SnoPUD's hourly feed caps at ~2 years.** Empirically, SnoPUD's portal
+  only returns hourly Green Button data for roughly the last 2 years
+  regardless of the requested window. For data older than that, you need
+  the billing-interval backfill toggle (under SnoPUD → Configure) — that
+  pulls one row per billing month and reaches as far back as your account
+  has billing records.
 - **Retention, in plain English.** Home Assistant keeps two kinds of
   history, and this integration uses both:
   1. **Long-term statistics** are kept indefinitely (they're the series
@@ -269,15 +281,22 @@ Common failure modes:
 
 ## Re-running the backfill
 
-If you just want to pull older **billing-interval** history for a meter
-that's already on your account, you don't need to delete anything — open
-Settings → Devices & Services → SnoPUD → Configure and turn on "Back-fill
-billing-interval history." The next refresh will run a one-shot retroactive
-import for any meter that hasn't already had one.
+Most re-import scenarios don't require deleting anything:
 
-If you want to wipe and re-import **all** history from scratch — e.g. to
-apply a longer `backfill_days` window to a meter that's already been
-backfilled, or because the existing series has drifted — do this:
+- **Need older billing-interval history?** Open Settings → Devices &
+  Services → SnoPUD → Configure and turn on "Back-fill billing-interval
+  history." The next refresh will run a one-shot retroactive import for
+  any meter that hasn't already had one.
+- **Need a deeper import than you originally set up with?** Raise the
+  "Initial hourly backfill window (days)" option. On the next refresh the
+  integration will re-import both the hourly series (idempotently — no
+  data destruction) and, if billing-backfill is on, the billing-interval
+  series, now reaching the new, wider horizon. Note that SnoPUD's hourly
+  feed caps at ~2 years regardless of how high you set this — for data
+  older than that you need billing-interval backfill enabled.
+
+Only if the existing series has drifted or is genuinely corrupt do you
+need the nuclear option:
 
 1. Remove the integration (Settings → Devices & Services → SnoPUD → ⋮ → Delete).
 2. In **Developer Tools → Statistics**, find each `snopud:...` series and

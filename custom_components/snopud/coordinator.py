@@ -48,6 +48,7 @@ from .const import (
     CONF_BACKFILLED_METERS,
     CONF_BILLING_BACKFILLED_METERS,
     CONF_ENABLE_BILLING_BACKFILL,
+    CONF_LAST_APPLIED_BACKFILL_DAYS,
     CONF_SCAN_INTERVAL_MINUTES,
     DEFAULT_BACKFILL_DAYS,
     DEFAULT_SCAN_INTERVAL_MINUTES,
@@ -197,6 +198,74 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         new_options = {**self._entry.options, CONF_BILLING_BACKFILLED_METERS: new}
         self.hass.config_entries.async_update_entry(self._entry, options=new_options)
 
+    async def _maybe_reset_backfill_for_widened_window(self) -> None:
+        """If ``backfill_days`` has been raised since we last honored it,
+        clear the per-meter backfill flags so the next cycle re-imports the
+        newly-uncovered range.
+
+        Without this, raising ``backfill_days`` from (e.g.) 730 to 1359 in
+        the options flow has no effect — both the hourly and billing flags
+        are latched, so subsequent refreshes only fetch the rolling 3-day
+        window. We compare the current value to the last persisted
+        "honored" value; on increase, clear flags and persist; on lower or
+        equal, just record the new value silently.
+
+        ``async_add_external_statistics`` is idempotent on
+        (statistic_id, start), so a re-import is non-destructive — at worst
+        it re-writes existing rows with the same values.
+        """
+        new_days = _resolve_backfill_days(self._entry)
+        last_raw = self._entry.options.get(CONF_LAST_APPLIED_BACKFILL_DAYS)
+        if last_raw is None:
+            # First-ever refresh on this entry (or first refresh on a v0.2.3
+            # upgrade from an older release). Just record the current value
+            # so future increases are detectable. We deliberately do NOT
+            # clear flags here — that would cause every existing user to
+            # re-import on the upgrade, which is surprising.
+            await self._persist_last_applied_backfill_days(new_days)
+            return
+        try:
+            last_days = int(last_raw)
+        except (TypeError, ValueError):
+            last_days = new_days
+        if new_days > last_days:
+            _LOGGER.info(
+                "backfill_days raised from %d to %d — clearing backfill "
+                "flags so the next refresh re-imports the additional %d "
+                "days of history",
+                last_days, new_days, new_days - last_days,
+            )
+            self._backfilled.clear()
+            self._billing_backfilled.clear()
+            # Persist cleared per-meter sets together with the new
+            # last-applied value, so a HA restart between this point and
+            # the next refresh doesn't lose the reset.
+            new_options = {
+                **self._entry.options,
+                CONF_BACKFILLED_METERS: [],
+                CONF_BILLING_BACKFILLED_METERS: [],
+                CONF_LAST_APPLIED_BACKFILL_DAYS: new_days,
+            }
+            self.hass.config_entries.async_update_entry(
+                self._entry, options=new_options
+            )
+        elif new_days != last_days:
+            # Lowered. No need to re-import (data we already have stays);
+            # just record the new value silently.
+            await self._persist_last_applied_backfill_days(new_days)
+
+    async def _persist_last_applied_backfill_days(self, days: int) -> None:
+        """Persist the value of backfill_days the coordinator last honored."""
+        if self._entry.options.get(CONF_LAST_APPLIED_BACKFILL_DAYS) == days:
+            return
+        new_options = {
+            **self._entry.options,
+            CONF_LAST_APPLIED_BACKFILL_DAYS: days,
+        }
+        self.hass.config_entries.async_update_entry(
+            self._entry, options=new_options
+        )
+
     async def _reseed_cumulative_from_stats(self, account_number: str) -> None:
         """Force-refresh the in-process cumulative counters from persisted
         stats, even if we've already seeded once. Used after a retroactive
@@ -239,6 +308,12 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch latest readings for each configured meter and import to statistics."""
+        # Detect a widened backfill window (user raised CONF_BACKFILL_DAYS in
+        # the options flow) and clear the per-meter backfill latches so the
+        # next pass re-imports the newly-uncovered range. Must run *before*
+        # the auth/fetch loop so the flag clears take effect this cycle.
+        await self._maybe_reset_backfill_for_widened_window()
+
         # Circuit breaker: if we've had repeated auth failures, stop trying.
         # The user must reload the config entry (typically after updating their
         # password) to reset. This avoids repeatedly submitting known-bad
@@ -482,25 +557,24 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         backfill_days = _resolve_backfill_days(self._entry)
         # Ask only for the slice strictly older than the earliest hourly point
         # we have for this meter — billing-interval rows older than that fill
-        # in pre-smart-meter history; rows newer than that would just collide
-        # with the finer-grain hourly series we already have.
+        # in pre-smart-meter history. Rows newer than that may still come
+        # back from SnoPUD (billing periods overlap the hourly window), but
+        # the import-supplement layer drops collisions so existing finer-grain
+        # hourly rows always win on overlap. We deliberately do NOT skip when
+        # billing_end falls outside the configured backfill window: walking
+        # back further is exactly how billing-interval supplementation reaches
+        # the pre-smart-meter history that's older than the hourly cap.
         earliest_hourly = (
             min(r.start for r in hourly_feed.readings).date()
             if hourly_feed.readings
             else today
         )
         billing_end = earliest_hourly - timedelta(days=1)
-        oldest_window = today - timedelta(days=backfill_days)
-        if billing_end <= oldest_window:
-            # No room for a billing slice older than the hourly window —
-            # nothing to fetch. Mark done so we don't re-attempt every cycle.
-            self._billing_backfilled.add(meter.account_number)
-            return 0
 
         _LOGGER.info(
             "running one-shot billing-interval supplement for meter %s "
-            "through %s",
-            meter.account_number, billing_end,
+            "through %s (walking back %d days)",
+            meter.account_number, billing_end, backfill_days,
         )
         try:
             billing = await self._chunked_backfill(
