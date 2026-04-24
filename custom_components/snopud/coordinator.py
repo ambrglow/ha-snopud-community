@@ -21,10 +21,19 @@ smart-meter upgrade. Billing-backfill state is tracked per-meter in
 backfill so enabling the option post-setup actually triggers the import.
 
 To survive Home Assistant restarts without producing a sawtooth in the
-sensor's monotonic ``cumulative_kwh`` value, we seed the in-process
-cumulative counters from the last persisted long-term-statistics ``sum`` for
-each meter on the first successful update after construction. This keeps the
-``total_increasing`` sensor monotonically increasing across restarts.
+sensor's monotonic ``cumulative_kwh`` value, we seed both the in-process
+cumulative counters **and** the per-meter "last-seen reading" cursor from
+the persisted long-term-statistics feed on the first successful update after
+construction. Seeding the cursor is critical: without it, the restart path
+would reseed the cumulative from hourly stats and then re-add the most
+recent 15-minute readings on top — producing a post-restart counter that
+over-counts the last SENSOR_LOOKBACK_DAYS of consumption.
+
+The cursor is set to ``last_hourly_start + 1h - 1µs`` — i.e. the last
+microsecond of the last sealed hour — so that every 15-minute reading
+falling inside that hour is correctly skipped on first advance (those
+readings are already summed into the hourly stats row), while the first
+reading of the next hour (``start = last_hourly_start + 1h``) is accepted.
 
 Meters that have already been backfilled (hourly and/or billing-interval)
 are tracked in ``entry.options`` so repeat backfills don't happen on every
@@ -34,6 +43,14 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timedelta, timezone
+
+# One-microsecond epsilon used when seeding ``_last_seen_cumulative`` from the
+# last persisted *hourly* stat. An hourly row starting at T covers [T, T+1h),
+# so the latest 15-minute slice already accounted for by that row starts at
+# T+45min (ends at T+1h). We set the cursor to T+1h-1µs so every 15-min slice
+# inside the hour is skipped by the ``<=`` check in ``_advance_cumulative``,
+# and the next hour's first slice (start=T+1h) is still accepted.
+_HOURLY_END_EPSILON = timedelta(hours=1) - timedelta(microseconds=1)
 from typing import Any
 
 import aiohttp
@@ -144,6 +161,12 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._cumulative_kwh: dict[str, float] = {}
         self._cumulative_cost_usd: dict[str, float] = {}
         self._cumulative_seeded: set[str] = set()
+        # Per-meter "latest reading timestamp already reflected in the
+        # cumulative counter". Used by ``_advance_cumulative`` to skip slices
+        # we've already added. Seeded from persisted hourly stats so restarts
+        # don't double-count the recent 15-minute rolling window — see
+        # ``_seed_cumulative_from_stats``.
+        self._last_seen_cumulative: dict[str, datetime] = {}
         # Circuit breaker state. After repeated auth failures we stop trying
         # until the config entry is reloaded, so a rotated password doesn't
         # cause us to repeatedly submit wrong credentials.
@@ -277,33 +300,69 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _seed_cumulative_from_stats(self, account_number: str) -> None:
         """Restart-sawtooth fix: load the most recent persisted statistics
         ``sum`` for each meter and use it as the starting cumulative value
-        for the in-process counter. Idempotent per meter."""
+        for the in-process counter. Also seeds ``_last_seen_cumulative`` so
+        that 15-minute readings already summed into the persisted hourly
+        stats aren't re-added on the first post-restart advance. Idempotent
+        per meter unless explicitly cleared (see
+        ``_reseed_cumulative_from_stats``)."""
         if account_number in self._cumulative_seeded:
             return
         recorder = get_instance(self.hass)
 
-        async def _last_sum(stat_id: str) -> float:
+        async def _last_sum_and_start(stat_id: str) -> tuple[float, datetime | None]:
             last = await recorder.async_add_executor_job(
-                get_last_statistics, self.hass, 1, stat_id, True, {"sum"}
+                get_last_statistics, self.hass, 1, stat_id, True, {"sum", "start"}
             )
             rows = last.get(stat_id) or []
             if not rows:
-                return 0.0
+                return 0.0, None
+            row = rows[0]
             try:
-                return float(rows[0].get("sum") or 0.0)
+                total = float(row.get("sum") or 0.0)
             except (TypeError, ValueError):
-                return 0.0
+                total = 0.0
+            start = row.get("start")
+            if start is None:
+                return total, None
+            if not hasattr(start, "tzinfo"):
+                # Some recorder versions hand back an epoch-seconds float.
+                try:
+                    start = datetime.fromtimestamp(float(start), tz=timezone.utc)
+                except (TypeError, ValueError):
+                    return total, None
+            return total, start
 
-        kwh_seed = await _last_sum(energy_statistic_id(account_number))
-        cost_seed = await _last_sum(cost_statistic_id(account_number))
+        kwh_seed, kwh_last_start = await _last_sum_and_start(
+            energy_statistic_id(account_number)
+        )
+        cost_seed, cost_last_start = await _last_sum_and_start(
+            cost_statistic_id(account_number)
+        )
         self._cumulative_kwh[account_number] = kwh_seed
         self._cumulative_cost_usd[account_number] = cost_seed
+
+        # Seed the "last seen" cursor to the last microsecond of the last
+        # sealed hour (T + 1h - 1µs). This ensures every 15-min slice *inside*
+        # that hour is skipped on first advance (they're already accounted
+        # for in the hourly sum we just seeded from), while the next hour's
+        # first slice at T+1h passes through.
+        if kwh_last_start is not None:
+            self._last_seen_cumulative[account_number] = (
+                kwh_last_start + _HOURLY_END_EPSILON
+            )
+        else:
+            # No persisted stats → no cursor → first advance will add every
+            # reading it's given. That's the correct behaviour for a
+            # first-ever import (before any hourly row has been written).
+            self._last_seen_cumulative.pop(account_number, None)
+
         self._cumulative_seeded.add(account_number)
-        if kwh_seed or cost_seed:
+        if kwh_seed or cost_seed or kwh_last_start is not None:
             _LOGGER.debug(
                 "seeded cumulative counters for %s from prior stats: "
-                "kWh=%.3f, USD=%.2f",
+                "kWh=%.3f, USD=%.2f, last_hourly_start=%s",
                 account_number, kwh_seed, cost_seed,
+                kwh_last_start.isoformat() if kwh_last_start else None,
             )
 
     async def _async_update_data(self) -> dict[str, Any]:
@@ -365,9 +424,6 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             today = datetime.now(timezone.utc).date()
 
             for meter in selected:
-                # Seed cumulative counters from persisted stats (idempotent).
-                await self._seed_cumulative_from_stats(meter.account_number)
-
                 # === Hourly path → Long-term statistics → Energy Dashboard ===
                 try:
                     hourly_feed = await self._fetch_hourly_for_meter(
@@ -405,6 +461,16 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         meter.account_number, err,
                     )
                     billing_added = 0
+
+                # Seed cumulative counters and last-seen cursor *after* the
+                # hourly import + optional billing supplement so the seed
+                # reflects the freshly-written state of the persisted stats.
+                # This is what keeps first-ever runs (empty stats at start,
+                # full backfill written during the refresh) and post-restart
+                # runs (stats already populated) both produce a counter that
+                # lines up with the persisted hourly ``sum``. Idempotent
+                # per meter per session.
+                await self._seed_cumulative_from_stats(meter.account_number)
 
                 # === 15-min path → sensor state ===
                 try:
@@ -462,11 +528,18 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> None:
         """Advance the in-process cumulative counters using only readings
         strictly later than the previously-seen latest one for this meter,
-        so we don't double-count when hourly + 15-min windows overlap."""
+        so we don't double-count when hourly + 15-min windows overlap.
+
+        ``_last_seen_cumulative`` is either (a) seeded from persisted hourly
+        stats on the first post-restart refresh (via
+        ``_seed_cumulative_from_stats``), or (b) maintained across refreshes
+        within a session by this method. Either way, it's the authoritative
+        "we've already added everything up to and including this timestamp"
+        cursor, and a reading at ``r.start <= cursor`` is always a duplicate.
+        """
         if not readings:
             return
-        last_seen_key = f"_last_seen_{account_number}"
-        last_seen: datetime | None = getattr(self, last_seen_key, None)
+        last_seen = self._last_seen_cumulative.get(account_number)
 
         kwh = 0.0
         cost = 0.0
@@ -488,7 +561,7 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._cumulative_cost_usd.get(account_number, 0.0) + cost
             )
         if latest is not None:
-            setattr(self, last_seen_key, latest)
+            self._last_seen_cumulative[account_number] = latest
 
     async def _fetch_hourly_for_meter(
         self,
@@ -512,12 +585,23 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 backfill_days,
                 meter.account_number,
             )
-            merged = await self._chunked_backfill(
+            merged, completed = await self._chunked_backfill(
                 client, meter, all_meters, today,
                 interval=DEFAULT_STATISTICS_INTERVAL,
                 total_days=backfill_days,
             )
-            self._backfilled.add(meter.account_number)
+            if completed:
+                self._backfilled.add(meter.account_number)
+            else:
+                # Partial backfill: import what we got, but don't latch the
+                # "done" flag — the next refresh will retry the full range.
+                # The import layer is idempotent on (statistic_id, start) so
+                # the chunks that did succeed won't be written twice.
+                _LOGGER.info(
+                    "hourly backfill for meter %s partially completed "
+                    "(%d chunks imported); will resume on next refresh",
+                    meter.account_number, len(merged.readings),
+                )
             return merged
 
         # Normal incremental hourly update: last 3 days covers the portal's
@@ -576,27 +660,29 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "through %s (walking back %d days)",
             meter.account_number, billing_end, backfill_days,
         )
-        try:
-            billing = await self._chunked_backfill(
-                client, meter, all_meters, billing_end,
-                interval=INTERVAL_BILLING,
-                total_days=backfill_days,
-            )
-        except SnoPUDDownloadError as err:
-            _LOGGER.warning(
-                "billing-interval supplement failed for meter %s: %s "
-                "(will retry on next refresh)",
-                meter.account_number, err,
-            )
-            return 0
+        # ``_chunked_backfill`` absorbs SnoPUDDownloadError internally and
+        # surfaces it via the ``completed`` flag, so we don't need a
+        # try/except around the call.
+        billing, completed = await self._chunked_backfill(
+            client, meter, all_meters, billing_end,
+            interval=INTERVAL_BILLING,
+            total_days=backfill_days,
+        )
 
         if not billing.readings:
-            _LOGGER.info(
-                "billing supplement for meter %s returned no readings — "
-                "marking complete so we don't keep retrying",
-                meter.account_number,
-            )
-            self._billing_backfilled.add(meter.account_number)
+            if completed:
+                _LOGGER.info(
+                    "billing supplement for meter %s returned no readings — "
+                    "marking complete so we don't keep retrying",
+                    meter.account_number,
+                )
+                self._billing_backfilled.add(meter.account_number)
+            else:
+                _LOGGER.info(
+                    "billing supplement for meter %s got no readings before "
+                    "a download error — will retry on next refresh",
+                    meter.account_number,
+                )
             return 0
 
         added = await async_import_billing_supplement(
@@ -609,7 +695,19 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # rebuilt from zero; refresh the in-process cumulative counter so
             # the sensor's TOTAL_INCREASING value reflects the new total.
             await self._reseed_cumulative_from_stats(meter.account_number)
-        self._billing_backfilled.add(meter.account_number)
+        # Only latch the "billing backfill done" flag on a fully-walked
+        # range. Partial completions retry on the next refresh; the
+        # supplement's rebuild-with-supplement merge is idempotent (existing
+        # values win on collision, new-to-us older values get added) so
+        # retries are safe.
+        if completed:
+            self._billing_backfilled.add(meter.account_number)
+        else:
+            _LOGGER.info(
+                "billing supplement for meter %s partially completed "
+                "(%d rows added this pass); will resume on next refresh",
+                meter.account_number, added,
+            )
         return added
 
     async def _fetch_sensor_for_meter(
@@ -645,12 +743,27 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         *,
         interval: str,
         total_days: int,
-    ) -> GreenButtonFeed:
-        """Walk backward in chunks of MAX_DOWNLOAD_WINDOW_DAYS until empty."""
+    ) -> tuple[GreenButtonFeed, bool]:
+        """Walk backward in chunks of MAX_DOWNLOAD_WINDOW_DAYS until empty.
+
+        Returns ``(merged_feed, completed)`` where ``completed`` is ``True``
+        iff the walk terminated naturally — either we covered the full
+        requested ``total_days`` or the portal returned an empty chunk
+        (meaning there is no further history to fetch). ``completed`` is
+        ``False`` if we broke out on a download error, i.e. there may still
+        be unfetched data in the requested range and a caller marking its
+        per-meter "backfilled" flag based on this call should NOT do so
+        until a later refresh returns ``completed=True``.
+
+        Even on partial completion, we still return whatever chunks we did
+        manage to download merged together — importing partial history is
+        better than none, and the import layer is idempotent.
+        """
         all_readings: list[IntervalReading] = []
         merged_feed: GreenButtonFeed | None = None
         days_remaining = total_days
         cursor = end
+        completed = True  # flips to False only on a download-error break
         while days_remaining > 0:
             window = min(MAX_DOWNLOAD_WINDOW_DAYS, days_remaining)
             start = cursor - timedelta(days=window)
@@ -668,6 +781,7 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "(stopping backfill, will resume on next refresh)",
                     start, cursor, meter.account_number, interval, err,
                 )
+                completed = False
                 break
             feed = parse_green_button(xml)
             if merged_feed is None:
@@ -676,11 +790,17 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             cursor = start - timedelta(days=1)
             days_remaining -= window
             if not feed.readings:
+                # Portal returned nothing for this window → no older history
+                # exists. That's a legitimate terminal condition, not a
+                # failure, so leave ``completed=True``.
                 break
 
         if merged_feed is None:
-            return GreenButtonFeed(
-                reading_type=None, readings=[], usage_point_id=None
+            return (
+                GreenButtonFeed(
+                    reading_type=None, readings=[], usage_point_id=None
+                ),
+                completed,
             )
         seen: set[float] = set()
         merged: list[IntervalReading] = []
@@ -690,8 +810,11 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 continue
             seen.add(ts)
             merged.append(r)
-        return GreenButtonFeed(
-            reading_type=merged_feed.reading_type,
-            readings=merged,
-            usage_point_id=merged_feed.usage_point_id,
+        return (
+            GreenButtonFeed(
+                reading_type=merged_feed.reading_type,
+                readings=merged,
+                usage_point_id=merged_feed.usage_point_id,
+            ),
+            completed,
         )
