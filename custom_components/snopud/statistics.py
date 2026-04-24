@@ -82,6 +82,19 @@ async def async_import_readings(
     Idempotent: replays of the same interval overwrite the existing value.
     Cumulative totals are computed by continuing from the last known 'sum'
     for each statistic_id, if one exists.
+
+    Handles two cases:
+
+    * **Pure append** — all incoming readings have timestamps strictly
+      newer than the last persisted row for that series. Fast path: accumulate
+      from the last persisted ``sum`` and upsert the new rows only.
+    * **Overlap / correction** — one or more incoming readings fall on or
+      before the last persisted row (e.g. SnoPUD revised a recently-imported
+      interval). Slow path: read the existing series in-window, merge new
+      values (new wins on timestamp collision), recompute cumulative ``sum``
+      from just-before-window onward, and upsert the merged rows. This way
+      late corrections actually land in the persisted stats instead of being
+      silently dropped.
     """
     if not readings:
         return
@@ -93,79 +106,112 @@ async def async_import_readings(
     energy_running, energy_last_dt = await _last_sum_and_time(hass, energy_id)
     cost_running, cost_last_dt = await _last_sum_and_time(hass, cost_id)
 
-    # Only import readings strictly after the last known point for each series.
-    energy_new = (
-        [r for r in readings if energy_last_dt is None or r.start > energy_last_dt]
+    # === Energy ===
+    any_energy_overlap = (
+        energy_last_dt is not None
+        and any(r.start <= energy_last_dt for r in readings)
     )
+    if any_energy_overlap:
+        energy_points = {r.start: r.value_kwh for r in readings}
+        await _rebuild_series_with_supplement(
+            hass,
+            statistic_id=energy_id,
+            unit=STATISTIC_UNIT_KWH,
+            name=f"SnoPUD Meter {meter.account_number} — Energy",
+            new_points_by_start=energy_points,
+            new_wins=True,
+        )
+    else:
+        energy_new = [
+            r for r in readings
+            if energy_last_dt is None or r.start > energy_last_dt
+        ]
+        if energy_new:
+            energy_payload = []
+            for r in energy_new:
+                energy_running += r.value_kwh
+                energy_payload.append(
+                    {
+                        "start": r.start,
+                        "state": r.value_kwh,   # kWh consumed during interval
+                        "sum": energy_running,  # monotonic cumulative kWh
+                    }
+                )
+            energy_metadata = {
+                "has_mean": False,
+                "has_sum": True,
+                "name": f"SnoPUD Meter {meter.account_number} — Energy",
+                "source": DOMAIN,
+                "statistic_id": energy_id,
+                "unit_of_measurement": STATISTIC_UNIT_KWH,
+            }
+            _LOGGER.info(
+                "importing %d energy readings for %s (from %s)",
+                len(energy_payload),
+                energy_id,
+                energy_new[0].start.isoformat(),
+            )
+            async_add_external_statistics(hass, energy_metadata, energy_payload)
+
+    # === Cost ===
     any_cost = any(r.cost_cents is not None for r in readings)
-    cost_new = (
-        [
+    if not any_cost:
+        return
+
+    any_cost_overlap = (
+        cost_last_dt is not None
+        and any(
+            r.start <= cost_last_dt for r in readings
+            if r.cost_cents is not None
+        )
+    )
+    if any_cost_overlap:
+        cost_points = {
+            r.start: (r.cost_cents or 0) / 100.0
+            for r in readings
+            if r.cost_cents is not None
+        }
+        await _rebuild_series_with_supplement(
+            hass,
+            statistic_id=cost_id,
+            unit=STATISTIC_UNIT_USD,
+            name=f"SnoPUD Meter {meter.account_number} — Cost",
+            new_points_by_start=cost_points,
+            new_wins=True,
+        )
+    else:
+        cost_new = [
             r for r in readings
             if r.cost_cents is not None
             and (cost_last_dt is None or r.start > cost_last_dt)
         ]
-        if any_cost
-        else []
-    )
-
-    if not energy_new and not cost_new:
-        _LOGGER.debug("no new readings for %s", meter.account_number)
-        return
-
-    if energy_new:
-        energy_payload = []
-        for r in energy_new:
-            energy_running += r.value_kwh
-            energy_payload.append(
-                {
-                    "start": r.start,
-                    "state": r.value_kwh,   # kWh consumed during this interval
-                    "sum": energy_running,  # monotonic cumulative kWh
-                }
+        if cost_new:
+            cost_payload = []
+            for r in cost_new:
+                dollars = (r.cost_cents or 0) / 100.0
+                cost_running += dollars
+                cost_payload.append(
+                    {
+                        "start": r.start,
+                        "state": dollars,
+                        "sum": cost_running,
+                    }
+                )
+            cost_metadata = {
+                "has_mean": False,
+                "has_sum": True,
+                "name": f"SnoPUD Meter {meter.account_number} — Cost",
+                "source": DOMAIN,
+                "statistic_id": cost_id,
+                "unit_of_measurement": STATISTIC_UNIT_USD,
+            }
+            _LOGGER.info(
+                "importing %d cost readings for %s (from %s)",
+                len(cost_payload),
+                cost_id,
+                cost_new[0].start.isoformat(),
             )
-        energy_metadata = {
-            "has_mean": False,
-            "has_sum": True,
-            "name": f"SnoPUD Meter {meter.account_number} — Energy",
-            "source": DOMAIN,
-            "statistic_id": energy_id,
-            "unit_of_measurement": STATISTIC_UNIT_KWH,
-        }
-        _LOGGER.info(
-            "importing %d energy readings for %s (from %s)",
-            len(energy_payload),
-            energy_id,
-            energy_new[0].start.isoformat(),
-        )
-        async_add_external_statistics(hass, energy_metadata, energy_payload)
-
-    if cost_new:
-        cost_payload = []
-        for r in cost_new:
-            dollars = (r.cost_cents or 0) / 100.0
-            cost_running += dollars
-            cost_payload.append(
-                {
-                    "start": r.start,
-                    "state": dollars,
-                    "sum": cost_running,
-                }
-            )
-        cost_metadata = {
-            "has_mean": False,
-            "has_sum": True,
-            "name": f"SnoPUD Meter {meter.account_number} — Cost",
-            "source": DOMAIN,
-            "statistic_id": cost_id,
-            "unit_of_measurement": STATISTIC_UNIT_USD,
-        }
-        _LOGGER.info(
-            "importing %d cost readings for %s (from %s)",
-            len(cost_payload),
-            cost_id,
-            cost_new[0].start.isoformat(),
-        )
-        async_add_external_statistics(hass, cost_metadata, cost_payload)
+            async_add_external_statistics(hass, cost_metadata, cost_payload)
 
 
 async def _last_sum_and_time(hass: HomeAssistant, statistic_id: str):
@@ -219,12 +265,15 @@ async def async_import_billing_supplement(
         if r.cost_cents is not None
     }
 
+    # Billing supplement is retroactive-fill only — existing finer-grain
+    # (hourly) data always wins on timestamp overlap, so ``new_wins=False``.
     written = await _rebuild_series_with_supplement(
         hass,
         statistic_id=energy_id,
         unit=STATISTIC_UNIT_KWH,
         name=f"SnoPUD Meter {meter.account_number} — Energy",
         new_points_by_start=new_energy_by_start,
+        new_wins=False,
     )
 
     if new_cost_by_start:
@@ -234,6 +283,7 @@ async def async_import_billing_supplement(
             unit=STATISTIC_UNIT_USD,
             name=f"SnoPUD Meter {meter.account_number} — Cost",
             new_points_by_start=new_cost_by_start,
+            new_wins=False,
         )
 
     return written
@@ -246,9 +296,21 @@ async def _rebuild_series_with_supplement(
     unit: str,
     name: str,
     new_points_by_start: dict,
+    new_wins: bool = False,
 ) -> int:
-    """Read existing stats, merge in new (older) points, recompute cumulative
-    ``sum`` from zero, upsert. Returns count of newly added points."""
+    """Read existing stats, merge in new points, recompute cumulative ``sum``
+    from zero, upsert. Returns count of newly added points.
+
+    ``new_wins`` controls the collision policy when a new point and an
+    existing point share a timestamp:
+
+    * ``False`` — existing wins. Used by the billing-interval supplement,
+      where the existing hourly-grain row is always more accurate than the
+      coarser billing-interval row that happens to cover the same hour.
+    * ``True``  — new wins. Used by the normal incremental import path when
+      SnoPUD has revised a recently-imported interval, so the latest
+      authoritative value replaces what we had.
+    """
     if not new_points_by_start:
         return 0
 
@@ -286,21 +348,30 @@ async def _rebuild_series_with_supplement(
         except (TypeError, ValueError):
             continue
 
-    # New points only count as "new" if there isn't already a point at that
-    # exact timestamp — existing data wins on overlap, so we never overwrite
-    # finer-grain hourly numbers with coarser billing-interval ones.
+    # Merge policy: when a new point and an existing row share a timestamp,
+    # ``new_wins`` decides which value to keep. Count rows as "added" when
+    # either the timestamp wasn't there before, or we're overwriting an
+    # existing row with a different value (revision).
     added = 0
     for start, value in new_points_by_start.items():
+        new_value = float(value)
         if start in existing_by_start:
-            continue
-        existing_by_start[start] = float(value)
-        added += 1
+            if not new_wins:
+                continue
+            if existing_by_start[start] == new_value:
+                continue
+            existing_by_start[start] = new_value
+            added += 1
+        else:
+            existing_by_start[start] = new_value
+            added += 1
 
     if added == 0:
         _LOGGER.debug(
-            "billing supplement for %s: nothing to add (all timestamps "
-            "already present in existing series)",
-            statistic_id,
+            "rebuild-with-supplement for %s: nothing to add or change "
+            "(new_wins=%s; all timestamps already present with matching "
+            "values)",
+            statistic_id, new_wins,
         )
         return 0
 
@@ -322,9 +393,9 @@ async def _rebuild_series_with_supplement(
         "unit_of_measurement": unit,
     }
     _LOGGER.info(
-        "billing supplement: rebuilding %s with %d total points "
-        "(%d newly added from billing-interval feed)",
-        statistic_id, len(payload), added,
+        "rebuild-with-supplement: rewriting %s with %d total points "
+        "(%d newly added or revised, new_wins=%s)",
+        statistic_id, len(payload), added, new_wins,
     )
     async_add_external_statistics(hass, metadata, payload)
     return added
