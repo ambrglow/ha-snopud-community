@@ -1,26 +1,26 @@
 """Sensor platform for SnoPUD.
 
-Exposes one sensor per configured meter. The sensor's ``native_value`` is the
-**cumulative kWh** counter for that meter, and the entity uses
-``state_class=total_increasing`` so HA's recorder treats it as a metered
-counter and produces hourly long-term aggregates from it automatically.
+Exposes one sensor per configured meter. The sensor's ``native_value`` is
+the **kWh consumed during the most recent 15-minute interval** reported by
+SnoPUD's Green Button feed — i.e. the latest 15-min slice value, not a
+cumulative counter. The entity uses ``state_class=measurement`` because it
+represents an instantaneous per-interval reading.
 
-The cumulative counter is seeded from the integration's persisted long-term
-statistics (see ``coordinator._seed_cumulative_from_stats``) on the first
-update after a Home Assistant restart, so it continues monotonically rather
-than restarting at zero (which would otherwise show up as a sawtooth in any
-downstream consumer like the Utility Meter helper).
+This is deliberately a thin pass-through of the upstream feed. The original
+design tried to maintain a synthetic monotonic ``cumulative_kwh`` counter
+inside the integration, seeded from the integration's persisted long-term
+statistics across HA restarts. That approach turned out to be fragile
+(seeding races with the recorder, sawtooth on every restart) and wasn't
+actually adding value — the Energy Dashboard reads from the parallel
+``snopud:energy_consumption_<account>`` external statistic written by
+``statistics.py``, which is the canonical cumulative feed. Users who need
+a cumulative counter at this finer grain can wrap this sensor in HA's
+built-in **Utility Meter** helper, which will integrate the per-interval
+deltas into a properly-monotonic counter automatically.
 
-The sensor's update cadence is the coordinator's poll interval, but the
-underlying readings come from the **15-minute** Green Button feed — so
-``latest_reading_at`` and ``latest_reading_kwh`` reflect 15-minute slices,
-suitable for dashboard cards and automations.
-
-This complements ``statistics.py``, which writes a parallel
-``snopud:energy_consumption_<account>`` external statistic on the hourly
-grain. The Energy Dashboard should be pointed at that external statistic
-(it's the canonical, idempotently-upserted feed); this sensor exists so users
-can wire current kWh into ordinary entities and automations.
+``latest_reading_at`` and ``cumulative_cost_usd`` (the latter still computed
+in the coordinator for cost-attribution) are exposed as extra state
+attributes for users who want to surface them in cards/automations.
 """
 from __future__ import annotations
 
@@ -57,11 +57,14 @@ async def async_setup_entry(
 
 
 class SnoPUDMeterSensor(CoordinatorEntity[SnoPUDCoordinator], SensorEntity):
-    """Cumulative-kWh sensor for a single SnoPUD meter, fed by 15-min readings."""
+    """Per-interval kWh sensor for a single SnoPUD meter (15-min Green Button slice)."""
 
     _attr_has_entity_name = True
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    # MEASUREMENT, not TOTAL_INCREASING — this sensor exposes the most
+    # recent 15-min slice's kWh value, not a cumulative counter. Wrap it
+    # in a Utility Meter helper if you want a monotonic total.
+    _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = STATISTIC_UNIT_KWH
 
     def __init__(self, coordinator: SnoPUDCoordinator, account_number: str) -> None:
@@ -81,12 +84,13 @@ class SnoPUDMeterSensor(CoordinatorEntity[SnoPUDCoordinator], SensorEntity):
         block = self._meter_block()
         if not block:
             return None
-        # The monotonic cumulative kWh counter, seeded across HA restarts from
-        # persisted long-term statistics so total_increasing stays monotonic.
-        total = block.get("cumulative_kwh")
-        if total is None:
+        # kWh consumed during the most recent 15-min interval — a thin
+        # pass-through of the upstream Green Button feed. No cumulative
+        # synthesis, no seeding from LTS, no cross-restart state.
+        latest = block.get("latest_reading_kwh")
+        if latest is None:
             return None
-        return round(float(total), 3)
+        return round(float(latest), 3)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -110,10 +114,11 @@ class SnoPUDMeterSensor(CoordinatorEntity[SnoPUDCoordinator], SensorEntity):
             attrs["latest_reading_kwh"] = block["latest_reading_kwh"]
         if "latest_reading_cost" in block:
             attrs["latest_reading_cost_usd"] = block["latest_reading_cost"]
-        if "cumulative_cost_usd" in block:
-            attrs["cumulative_cost_usd"] = round(
-                float(block["cumulative_cost_usd"]), 2
-            )
+        # NOTE: cumulative_cost_usd / cumulative_kwh are intentionally NOT
+        # exposed. They were synthetic counters that drifted across
+        # restarts; the canonical cumulative feed is the long-term
+        # statistic written by ``statistics.py``, which the Energy
+        # Dashboard reads directly.
         return attrs
 
     @property
