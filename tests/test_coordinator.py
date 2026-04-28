@@ -311,6 +311,84 @@ def test_restart_scenario_without_cursor_seed_would_double_count() -> None:
     print("✓ negative control: pre-fix behavior reproduces double-count")
 
 
+def test_seed_cumulative_self_heals_from_stale_initial_read() -> None:
+    """Regression test for the CSV-bug pattern.
+
+    In production we observed sensor values like:
+      pre-restart:   87.36
+      post-restart:  718.973   ← seed read 0, advance added 7d of 15-min
+      ...           830.326    ← still wrong, latch prevented re-seed
+      eventually:   31423.973  ← only fixed via the billing-supplement path
+
+    Root cause: the seed was latched once-per-process. If the very first
+    post-restart seed read 0 (because ``async_add_external_statistics`` had
+    not yet been flushed to the recorder, or because of a transient DB
+    hiccup), the bad value would stick for the rest of the process
+    lifetime.
+
+    Fix: ``_seed_cumulative_from_stats`` is no longer latched. Subsequent
+    refreshes re-read the LTS and pick up the real value, healing the
+    counter automatically. This test simulates that exact scenario:
+    first seed returns 0, second seed returns the real cumulative — and
+    asserts the in-memory counter ends up at the real value, not stuck
+    on whatever was accumulated against the stale 0.
+    """
+    c = _make_coord()
+
+    # Scripted seed source: first call returns (0.0, None) — pretending
+    # the recorder hasn't flushed; second call returns the correct value.
+    seeds = iter([
+        (0.0, None),
+        (1000.0, datetime(2026, 4, 22, 14, 0, tzinfo=timezone.utc)),
+    ])
+
+    async def _scripted_seed(account_number: str) -> None:
+        kwh_seed, kwh_last_start = next(seeds)
+        c._cumulative_kwh[account_number] = kwh_seed
+        c._cumulative_cost_usd[account_number] = 0.0
+        if kwh_last_start is not None:
+            c._last_seen_cumulative[account_number] = (
+                kwh_last_start + _HOURLY_END_EPSILON
+            )
+        else:
+            c._last_seen_cumulative.pop(account_number, None)
+
+    # First refresh: stale seed (0) → advance with 4 readings → counter
+    # ends up at 4 × 0.25 = 1.0 kWh. Wrong, but that's the transient state.
+    asyncio.run(_scripted_seed("ACCT"))
+    c._advance_cumulative(
+        "ACCT",
+        [_reading(14, 0), _reading(14, 15), _reading(14, 30), _reading(14, 45)],
+    )
+    assert c._cumulative_kwh["ACCT"] == 1.0, (
+        f"first refresh should accumulate against stale seed; got "
+        f"{c._cumulative_kwh['ACCT']}"
+    )
+
+    # Second refresh: seed re-runs (no latch), reads the *real* value
+    # (1000.0) AND seeds the cursor to 14:00 + 1h - 1µs. The next advance
+    # now skips the in-hour 15-min slices (already in the hourly sum) and
+    # only adds genuinely new 15:00+ slices. Critically, the in-memory
+    # counter resets to 1000.0 — *not* 1000.0 + (whatever stale value we
+    # had). The LTS is the source of truth.
+    asyncio.run(_scripted_seed("ACCT"))
+    assert c._cumulative_kwh["ACCT"] == 1000.0, (
+        f"second seed must overwrite the stale in-memory cumulative with "
+        f"the real LTS sum; got {c._cumulative_kwh['ACCT']}"
+    )
+    c._advance_cumulative(
+        "ACCT",
+        [_reading(14, 0), _reading(14, 15), _reading(14, 30), _reading(14, 45),
+         _reading(15, 0), _reading(15, 15)],
+    )
+    # Only the two 15:00+ slices contribute: 1000 + 0.5 = 1000.5.
+    assert c._cumulative_kwh["ACCT"] == 1000.5, (
+        f"after second seed + advance, expected 1000.5; got "
+        f"{c._cumulative_kwh['ACCT']}"
+    )
+    print("✓ seed is non-latched: stale initial read self-heals on re-seed")
+
+
 def test_advance_cumulative_empty_readings_noop() -> None:
     """Advancing with an empty reading list is a no-op in every field."""
     c = _make_coord()
@@ -484,4 +562,5 @@ if __name__ == "__main__":
     test_restart_scenario_does_not_double_count()
     test_chunked_backfill_partial_failure_does_not_mark_complete()
     test_chunked_backfill_full_success_marks_complete()
+    test_seed_cumulative_self_heals_from_stale_initial_read()
     print("\nall coordinator tests passed")

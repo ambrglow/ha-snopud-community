@@ -23,11 +23,21 @@ backfill so enabling the option post-setup actually triggers the import.
 To survive Home Assistant restarts without producing a sawtooth in the
 sensor's monotonic ``cumulative_kwh`` value, we seed both the in-process
 cumulative counters **and** the per-meter "last-seen reading" cursor from
-the persisted long-term-statistics feed on the first successful update after
-construction. Seeding the cursor is critical: without it, the restart path
-would reseed the cumulative from hourly stats and then re-add the most
-recent 15-minute readings on top — producing a post-restart counter that
-over-counts the last SENSOR_LOOKBACK_DAYS of consumption.
+the persisted long-term-statistics feed on **every** successful update
+(after the hourly LTS write for this cycle has been flushed). Seeding the
+cursor is critical: without it, the restart path would reseed the
+cumulative from hourly stats and then re-add the most recent 15-minute
+readings on top — producing a post-restart counter that over-counts the
+last SENSOR_LOOKBACK_DAYS of consumption.
+
+The seed used to be latched once-per-process for efficiency, but that turned
+out to be a footgun: if the very first post-restart seed read a stale or
+empty LTS (because ``async_add_external_statistics`` hadn't flushed yet),
+the bad value would stick for the entire process lifetime. Re-seeding every
+refresh costs one row read per meter against the recorder, which is
+negligible compared to the network fetches we're already doing, and the
+guarantee that a transient bad seed self-heals on the next refresh is
+worth it.
 
 The cursor is set to ``last_hourly_start + 1h - 1µs`` — i.e. the last
 microsecond of the last sealed hour — so that every 15-minute reading
@@ -154,12 +164,21 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         persisted_billing = entry.options.get(CONF_BILLING_BACKFILLED_METERS, [])
         self._billing_backfilled: set[str] = set(persisted_billing)
         # Cumulative kWh/USD per meter. We *seed* these from
-        # get_last_statistics on the first successful update per meter so that
+        # get_last_statistics on every successful update per meter so that
         # the sensor's TOTAL_INCREASING value continues monotonically across
         # restarts (otherwise it would reset to 0, producing a sawtooth and
         # confusing every consumer downstream — Utility Meter especially).
+        # Re-seeding every refresh is what makes a stale or empty initial
+        # read self-heal on the next pass instead of poisoning the counter
+        # for the rest of the process lifetime.
         self._cumulative_kwh: dict[str, float] = {}
         self._cumulative_cost_usd: dict[str, float] = {}
+        # Vestigial: ``_seed_cumulative_from_stats`` used to be latched
+        # once-per-process via this set, but the latch was the root cause
+        # of an intermittent post-restart "stuck on stale seed" bug
+        # (see issue history). The seed is now non-latched. The attribute
+        # is kept as an empty set so older test fixtures that touch it
+        # don't AttributeError.
         self._cumulative_seeded: set[str] = set()
         # Per-meter "latest reading timestamp already reflected in the
         # cumulative counter". Used by ``_advance_cumulative`` to skip slices
@@ -290,11 +309,15 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     async def _reseed_cumulative_from_stats(self, account_number: str) -> None:
-        """Force-refresh the in-process cumulative counters from persisted
-        stats, even if we've already seeded once. Used after a retroactive
-        billing supplement, which changes the persisted ``sum`` for prior
-        rows and would otherwise leave the in-process counter stale."""
-        self._cumulative_seeded.discard(account_number)
+        """Backwards-compatible alias for ``_seed_cumulative_from_stats``.
+
+        Historically this method existed to force a re-seed after a
+        billing supplement (the old seed was latched once-per-process so a
+        forced bypass was needed). The seed is now non-latched and
+        recomputed from persisted stats on every refresh, so this method
+        and the canonical seed are equivalent. Kept as an alias because
+        external callers and tests still reference it.
+        """
         await self._seed_cumulative_from_stats(account_number)
 
     async def _seed_cumulative_from_stats(self, account_number: str) -> None:
@@ -302,12 +325,41 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ``sum`` for each meter and use it as the starting cumulative value
         for the in-process counter. Also seeds ``_last_seen_cumulative`` so
         that 15-minute readings already summed into the persisted hourly
-        stats aren't re-added on the first post-restart advance. Idempotent
-        per meter unless explicitly cleared (see
-        ``_reseed_cumulative_from_stats``)."""
-        if account_number in self._cumulative_seeded:
-            return
+        stats aren't re-added on the next advance.
+
+        **Re-seeding is intentionally NOT latched** — it runs on every
+        refresh after the hourly LTS write so that:
+
+        * A bad initial seed (e.g. LTS not yet flushed when we first read
+          it after a fresh install or HA restart) is self-healing on the
+          very next refresh, instead of poisoning the cumulative for the
+          entire process lifetime.
+        * The cursor (``_last_seen_cumulative``) is always pinned to the
+          last sealed hour from the persisted stats, so 15-min readings
+          inside that hour are deduped against the hourly sum.
+        * Retroactive writes (e.g. the billing-interval supplement) that
+          rebuild the persisted ``sum`` from zero are picked up on the
+          following refresh without requiring a separate force-reseed
+          path.
+
+        We block on the recorder's queue draining first so that any LTS
+        writes scheduled earlier in the same refresh are visible to this
+        read — without that block the read can outrun a recently-queued
+        write and seed from a stale ``sum``.
+        """
         recorder = get_instance(self.hass)
+        # Drain any pending recorder tasks (specifically the
+        # ``async_add_external_statistics`` writes scheduled by
+        # ``async_import_readings`` earlier in this refresh) so the
+        # ``get_last_statistics`` read below sees the just-written rows.
+        # Falls back to a no-op on recorder stubs (used by the unit tests)
+        # that don't expose ``async_block_till_done``.
+        block_till_done = getattr(recorder, "async_block_till_done", None)
+        if callable(block_till_done):
+            try:
+                await block_till_done()
+            except Exception:  # noqa: BLE001 — never fail seed on block error
+                pass
 
         async def _last_sum_and_start(stat_id: str) -> tuple[float, datetime | None]:
             last = await recorder.async_add_executor_job(
@@ -356,7 +408,6 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # first-ever import (before any hourly row has been written).
             self._last_seen_cumulative.pop(account_number, None)
 
-        self._cumulative_seeded.add(account_number)
         if kwh_seed or cost_seed or kwh_last_start is not None:
             _LOGGER.debug(
                 "seeded cumulative counters for %s from prior stats: "

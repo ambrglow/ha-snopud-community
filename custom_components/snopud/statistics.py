@@ -37,7 +37,47 @@ from homeassistant.components.recorder.statistics import (
 from homeassistant.components.recorder.util import get_instance
 from homeassistant.core import HomeAssistant
 
+# ``StatisticMeanType`` was introduced alongside the recorder statistics
+# metadata refresh. Older HA releases don't have it; emitting metadata
+# without a ``mean_type`` key works fine on those, while newer releases
+# (2026.11+) require the explicit value. Import defensively so the
+# integration still loads on older HA cores.
+try:
+    from homeassistant.components.recorder.models.statistics import (
+        StatisticMeanType,
+    )
+    _STATISTIC_MEAN_TYPE_NONE = StatisticMeanType.NONE
+except ImportError:  # pragma: no cover — pre-mean_type HA cores
+    _STATISTIC_MEAN_TYPE_NONE = None
+
 from .const import DOMAIN, STATISTIC_UNIT_KWH, STATISTIC_UNIT_USD
+
+
+def _stat_metadata(*, statistic_id: str, name: str, unit: str) -> dict:
+    """Build a metadata dict for ``async_add_external_statistics``.
+
+    Centralised so both the kWh and USD series carry identical fields and
+    we set ``mean_type`` in exactly one place. We use
+    ``StatisticMeanType.NONE`` because both series are sum-only
+    (``has_mean=False``); no arithmetic average is computed for them.
+
+    On HA cores that predate ``StatisticMeanType``, the ``mean_type`` key is
+    omitted entirely — the recorder ignores unknown keys, and ``has_mean``
+    alone was the source of truth on those releases.
+    """
+    metadata: dict = {
+        "has_mean": False,
+        "has_sum": True,
+        "name": name,
+        "source": DOMAIN,
+        "statistic_id": statistic_id,
+        "unit_of_measurement": unit,
+    }
+    if _STATISTIC_MEAN_TYPE_NONE is not None:
+        # Required on HA 2026.11+; harmless on the releases that introduced
+        # the enum but didn't yet make it mandatory.
+        metadata["mean_type"] = _STATISTIC_MEAN_TYPE_NONE
+    return metadata
 
 if TYPE_CHECKING:
     from .green_button import IntervalReading
@@ -137,14 +177,11 @@ async def async_import_readings(
                         "sum": energy_running,  # monotonic cumulative kWh
                     }
                 )
-            energy_metadata = {
-                "has_mean": False,
-                "has_sum": True,
-                "name": f"SnoPUD Meter {meter.account_number} — Energy",
-                "source": DOMAIN,
-                "statistic_id": energy_id,
-                "unit_of_measurement": STATISTIC_UNIT_KWH,
-            }
+            energy_metadata = _stat_metadata(
+                statistic_id=energy_id,
+                name=f"SnoPUD Meter {meter.account_number} — Energy",
+                unit=STATISTIC_UNIT_KWH,
+            )
             _LOGGER.info(
                 "importing %d energy readings for %s (from %s)",
                 len(energy_payload),
@@ -197,14 +234,11 @@ async def async_import_readings(
                         "sum": cost_running,
                     }
                 )
-            cost_metadata = {
-                "has_mean": False,
-                "has_sum": True,
-                "name": f"SnoPUD Meter {meter.account_number} — Cost",
-                "source": DOMAIN,
-                "statistic_id": cost_id,
-                "unit_of_measurement": STATISTIC_UNIT_USD,
-            }
+            cost_metadata = _stat_metadata(
+                statistic_id=cost_id,
+                name=f"SnoPUD Meter {meter.account_number} — Cost",
+                unit=STATISTIC_UNIT_USD,
+            )
             _LOGGER.info(
                 "importing %d cost readings for %s (from %s)",
                 len(cost_payload),
@@ -384,14 +418,9 @@ async def _rebuild_series_with_supplement(
         running += state
         payload.append({"start": start, "state": state, "sum": running})
 
-    metadata = {
-        "has_mean": False,
-        "has_sum": True,
-        "name": name,
-        "source": DOMAIN,
-        "statistic_id": statistic_id,
-        "unit_of_measurement": unit,
-    }
+    metadata = _stat_metadata(
+        statistic_id=statistic_id, name=name, unit=unit,
+    )
     _LOGGER.info(
         "rebuild-with-supplement: rewriting %s with %d total points "
         "(%d newly added or revised, new_wins=%s)",
