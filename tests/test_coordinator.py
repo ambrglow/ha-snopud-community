@@ -168,6 +168,11 @@ client_stub.SnoPUDClient = type("SnoPUDClient", (), {})
 client_stub.SnoPUDDownloadError = type("SnoPUDDownloadError", (Exception,), {})
 client_stub.SnoPUDError = type("SnoPUDError", (Exception,), {})
 sys.modules["custom_components.snopud.snopud_client"] = client_stub
+# Capture references at import time so later tests in the same pytest
+# session can't shadow them by re-importing the real ``snopud_client``
+# module. The chunked-backfill tests below catch this exception class to
+# simulate a transient SnoPUD download failure.
+_STUB_SnoPUDDownloadError = client_stub.SnoPUDDownloadError
 
 coord_mod = _load(
     "custom_components.snopud.coordinator",
@@ -188,6 +193,8 @@ def _make_coord() -> "SnoPUDCoordinator":
     c._cumulative_cost_usd = {}
     c._cumulative_seeded = set()
     c._last_seen_cumulative = {}
+    # State for ``_merge_recent_intervals`` (added in v0.2.7).
+    c._recent_intervals_by_start = {}
     return c
 
 
@@ -435,9 +442,12 @@ def test_chunked_backfill_partial_failure_does_not_mark_complete() -> None:
     """
     c = _make_coord()
 
-    SnoPUDDownloadError = sys.modules[
-        "custom_components.snopud.snopud_client"
-    ].SnoPUDDownloadError
+    # Use the captured stub class rather than re-reading from sys.modules at
+    # call time — under pytest collection, an earlier test in the same
+    # session may have imported the real ``snopud_client`` module and
+    # replaced the stub, in which case sys.modules now points at a real
+    # module without our test fixtures.
+    SnoPUDDownloadError = _STUB_SnoPUDDownloadError
     gb = sys.modules["custom_components.snopud.green_button"]
 
     # Script: first chunk returns a non-empty feed (so the walk *doesn't*
@@ -553,6 +563,268 @@ def test_hourly_end_epsilon_math() -> None:
     print("✓ _HOURLY_END_EPSILON boundary math is correct")
 
 
+# ---------------------------------------------------------------------------
+# recent_intervals merge (v0.2.7+)
+# ---------------------------------------------------------------------------
+
+# Pull the limit from the loaded const module rather than re-defining it, so a
+# future change to the constant flows through the tests automatically.
+SENSOR_RECENT_INTERVAL_LIMIT = sys.modules[
+    "custom_components.snopud.const"
+].SENSOR_RECENT_INTERVAL_LIMIT
+
+
+def test_merge_recent_intervals_includes_every_new_bucket() -> None:
+    """Regression test for the SnoPUD-lag bug.
+
+    SnoPUD's portal can lag 6–8 hours. When a single refresh's parsed feed
+    surfaces multiple newly-available 15-minute buckets at once (e.g. at
+    8 PM the export newly contains 10 AM, 10:15 AM, 10:30 AM, …), the
+    ``recent_intervals`` array must include EVERY one of them — not just
+    the newest. This is the whole point of the redesign: the bar chart
+    fills in retroactively as the portal catches up, instead of showing
+    only the single newest bar.
+    """
+    c = _make_coord()
+    # Simulate a refresh in which the export newly reveals four 15-minute
+    # intervals from 10:00 AM to 11:00 AM. Each is 900 s long.
+    feed = [
+        _reading(10, 0,  wh=333),
+        _reading(10, 15, wh=310),
+        _reading(10, 30, wh=358),
+        _reading(10, 45, wh=275),
+    ]
+    out = c._merge_recent_intervals("ACCT", feed)
+    assert len(out) == 4, (
+        f"expected all 4 newly-discovered buckets to be included, got "
+        f"{len(out)}"
+    )
+    # Sorted chronologically, oldest first.
+    starts = [item["start"] for item in out]
+    assert starts == sorted(starts), "recent_intervals must be sorted by start"
+    # kWh values round to mWh precision — meters report integer Wh.
+    assert out[0]["kwh"] == 0.333
+    assert out[1]["kwh"] == 0.310
+    assert out[2]["kwh"] == 0.358
+    assert out[3]["kwh"] == 0.275
+    # Each entry carries an ``end`` matching ``start + 15min``.
+    for item in out:
+        start = datetime.fromisoformat(item["start"])
+        end = datetime.fromisoformat(item["end"])
+        assert end - start == timedelta(minutes=15)
+    print("✓ recent_intervals includes every newly-discovered bucket")
+
+
+def test_merge_recent_intervals_dedups_by_start_across_refreshes() -> None:
+    """Across two refreshes whose 15-min feeds overlap, ``recent_intervals``
+    must dedupe by interval start (newer fetch wins) — and brand-new buckets
+    discovered in the second refresh must still appear."""
+    c = _make_coord()
+
+    # Refresh #1: portal currently exposes 09:00–10:00 (4 buckets).
+    refresh1 = [_reading(9, m, wh=200) for m in (0, 15, 30, 45)]
+    out1 = c._merge_recent_intervals("ACCT", refresh1)
+    assert len(out1) == 4
+
+    # Refresh #2: portal has caught up — feed now contains 09:30 through
+    # 11:00 (overlapping the first refresh's 09:30 + 09:45, plus four new
+    # 10:xx buckets and one 11:00 bucket). The 09:30/09:45 readings now
+    # have *revised* values, so the new fetch should win on those keys.
+    refresh2 = (
+        [_reading(9, 30, wh=222), _reading(9, 45, wh=242)]
+        + [_reading(10, m, wh=275) for m in (0, 15, 30, 45)]
+        + [_reading(11, 0, wh=290)]
+    )
+    out2 = c._merge_recent_intervals("ACCT", refresh2)
+
+    # 4 (from refresh #1) + 4 new 10:xx + 1 new 11:00 - 0 dropped = 9.
+    assert len(out2) == 9, (
+        f"expected 4 carried over (with 2 revised) + 5 new = 9 buckets, got "
+        f"{len(out2)}"
+    )
+    # Verify the revised 09:30 and 09:45 values won out over the originals
+    # — newer fetch wins on collision.
+    by_start = {item["start"]: item for item in out2}
+    assert by_start[refresh1[2].start.isoformat()]["kwh"] == 0.222
+    assert by_start[refresh1[3].start.isoformat()]["kwh"] == 0.242
+    # The 09:00 / 09:15 buckets that weren't in refresh #2 stayed put.
+    assert by_start[refresh1[0].start.isoformat()]["kwh"] == 0.200
+    assert by_start[refresh1[1].start.isoformat()]["kwh"] == 0.200
+    # Brand-new buckets are present.
+    assert refresh2[-1].start.isoformat() in by_start
+    print("✓ recent_intervals dedups by start across refreshes; new wins")
+
+
+def test_merge_recent_intervals_trims_to_retention_limit() -> None:
+    """When the rolling window exceeds ``SENSOR_RECENT_INTERVAL_LIMIT``, the
+    oldest entries are dropped — and the in-memory backing dict is rebuilt
+    so it doesn't leak memory across refreshes."""
+    c = _make_coord()
+    # Fabricate (LIMIT + 50) consecutive 15-min readings.
+    base = datetime(2026, 4, 22, 0, 0, tzinfo=timezone.utc)
+    n = SENSOR_RECENT_INTERVAL_LIMIT + 50
+    feed = [
+        IntervalReading(
+            start=base + timedelta(minutes=15 * i),
+            duration_seconds=900,
+            value_wh=200,
+        )
+        for i in range(n)
+    ]
+    out = c._merge_recent_intervals("ACCT", feed)
+    assert len(out) == SENSOR_RECENT_INTERVAL_LIMIT, (
+        f"expected output trimmed to {SENSOR_RECENT_INTERVAL_LIMIT}, got "
+        f"{len(out)}"
+    )
+    # The retained slice is the most-recent ``LIMIT`` entries, in order.
+    assert out[0]["start"] == feed[50].start.isoformat(), (
+        "expected the oldest 50 buckets to be dropped"
+    )
+    assert out[-1]["start"] == feed[-1].start.isoformat()
+    # And the backing dict was rebuilt to the trimmed set, not the full set.
+    assert len(c._recent_intervals_by_start["ACCT"]) == SENSOR_RECENT_INTERVAL_LIMIT
+    print("✓ recent_intervals trims to retention limit and rebuilds backing dict")
+
+
+def test_merge_recent_intervals_skips_non_15min_readings() -> None:
+    """If the 15-min download fails and the coordinator falls back to the
+    hourly feed, those 3600-second readings must NOT pollute the bar chart's
+    rolling window — every bucket in ``recent_intervals`` must be a true
+    900-second slice."""
+    c = _make_coord()
+    mixed = [
+        IntervalReading(
+            start=datetime(2026, 4, 22, 9, 0, tzinfo=timezone.utc),
+            duration_seconds=3600,           # hourly fallback — REJECTED
+            value_wh=1000,
+        ),
+        IntervalReading(
+            start=datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc),
+            duration_seconds=900,            # genuine 15-min — accepted
+            value_wh=250,
+        ),
+        IntervalReading(
+            start=datetime(2026, 4, 22, 10, 15, tzinfo=timezone.utc),
+            duration_seconds=1800,           # half-hour — REJECTED
+            value_wh=500,
+        ),
+    ]
+    out = c._merge_recent_intervals("ACCT", mixed)
+    assert len(out) == 1, f"expected only the 900s reading, got {len(out)}"
+    assert out[0]["kwh"] == 0.250
+    print("✓ recent_intervals rejects non-15-minute readings")
+
+
+def test_merge_recent_intervals_carries_cost_when_present() -> None:
+    """When the SnoPUD feed carries cost data, each bucket should expose a
+    ``cost_usd`` field. Buckets without cost data must not have the key
+    (rather than ``None``) so consumers can rely on its presence."""
+    c = _make_coord()
+    feed = [
+        _reading(10, 0,  wh=250, cost_cents=12),
+        _reading(10, 15, wh=250),  # no cost
+    ]
+    out = c._merge_recent_intervals("ACCT", feed)
+    assert "cost_usd" in out[0]
+    assert out[0]["cost_usd"] == 0.12
+    assert "cost_usd" not in out[1]
+    print("✓ recent_intervals carries cost_usd only when present in feed")
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap-deadlock regression (v0.2.8)
+# ---------------------------------------------------------------------------
+
+def test_seed_proceeds_when_recorder_block_till_done_hangs() -> None:
+    """Regression test for the v0.2.8 bug.
+
+    Repro from production: on a HACS upgrade restart, the recorder's worker
+    task hadn't finished starting up by the time SnoPUD's first refresh
+    fired. ``recorder.async_block_till_done()`` then waited forever for a
+    queue that nobody was draining, and the integration's
+    ``async_config_entry_first_refresh`` hung until HA's stage-2 setup
+    timeout (5 minutes) tripped and cancelled the task — leaving the
+    integration stuck on "Initializing".
+
+    The fix: bound the ``block_till_done`` await with
+    ``asyncio.wait_for(..., timeout=5.0)`` and proceed on TimeoutError. The
+    seed read may then hit slightly-stale persisted stats; the unlatched
+    re-seed on the next refresh self-heals.
+
+    This test installs a recorder stub whose ``async_block_till_done``
+    sleeps for 60 seconds (well past the 5-second cap), confirms that
+    ``_seed_cumulative_from_stats`` returns within ~5 seconds rather than
+    hanging, and confirms the seed read still happened (i.e. we proceeded
+    past the timeout instead of erroring out).
+    """
+    c = _make_coord()
+
+    # Recorder stub: ``async_block_till_done`` sleeps long enough that the
+    # 5-second cap is the only reason the call returns. ``async_add_executor_job``
+    # synchronously calls the wrapped function, returning {} from
+    # ``get_last_statistics`` (no persisted stats).
+    block_call_count = {"n": 0}
+    block_completed = {"n": 0}
+
+    class _HangingRecorder:
+        async def async_block_till_done(self) -> None:
+            block_call_count["n"] += 1
+            try:
+                # Simulate the bootstrap-stage-2 deadlock: nobody is draining
+                # this queue, so the await would never complete on its own.
+                await asyncio.sleep(60.0)
+            finally:
+                # If we got cancelled by wait_for's timeout, this still runs.
+                block_completed["n"] += 1
+
+        async def async_add_executor_job(self, fn, *args, **kwargs):
+            # Real recorder runs the function on its executor pool. For the
+            # test, just call it inline. Returns whatever
+            # ``get_last_statistics`` returns; the stub default is {}.
+            return fn(*args, **kwargs)
+
+    # The coordinator module imported ``get_instance`` at module-load time
+    # via ``from homeassistant.components.recorder.util import get_instance``,
+    # so it holds its own bound reference. Patch THAT binding (not just the
+    # source module's) so the seed code path actually sees our hanging
+    # recorder.
+    original_get_instance = coord_mod.get_instance
+    coord_mod.get_instance = lambda hass: _HangingRecorder()
+
+    try:
+        # Wall-clock the call. Should complete in ~5s (the cap), not 60s
+        # (what the hang would take), and not hang forever.
+        import time as _time
+        c.hass = object()  # placeholder; not used by the seed code path
+        start = _time.monotonic()
+        asyncio.run(c._seed_cumulative_from_stats("ACCT"))
+        elapsed = _time.monotonic() - start
+    finally:
+        coord_mod.get_instance = original_get_instance
+
+    # Must have invoked block_till_done exactly once.
+    assert block_call_count["n"] == 1, (
+        f"expected block_till_done called once, got {block_call_count['n']}"
+    )
+    # Must have returned around the 5s cap, definitely not the 60s the
+    # hang would have taken if unbounded.
+    assert 4.5 <= elapsed <= 10.0, (
+        f"expected ~5s elapsed (the wait_for cap); got {elapsed:.2f}s — "
+        f"if much higher, the timeout cap regressed; if much lower, the "
+        f"call somehow returned before the cap fired"
+    )
+    # The seed code must have continued past the timeout: with no
+    # persisted stats, both running totals seed to 0.
+    assert c._cumulative_kwh.get("ACCT") == 0.0, (
+        "seed must proceed past block_till_done timeout and call "
+        "get_last_statistics; got no kWh seed"
+    )
+    print(
+        f"✓ seed completes in {elapsed:.2f}s when block_till_done hangs "
+        f"(bootstrap-deadlock fix verified)"
+    )
+
+
 if __name__ == "__main__":
     test_hourly_end_epsilon_math()
     test_advance_cumulative_no_cursor_adds_everything()
@@ -563,4 +835,10 @@ if __name__ == "__main__":
     test_chunked_backfill_partial_failure_does_not_mark_complete()
     test_chunked_backfill_full_success_marks_complete()
     test_seed_cumulative_self_heals_from_stale_initial_read()
+    test_merge_recent_intervals_includes_every_new_bucket()
+    test_merge_recent_intervals_dedups_by_start_across_refreshes()
+    test_merge_recent_intervals_trims_to_retention_limit()
+    test_merge_recent_intervals_skips_non_15min_readings()
+    test_merge_recent_intervals_carries_cost_when_present()
+    test_seed_proceeds_when_recorder_block_till_done_hangs()
     print("\nall coordinator tests passed")

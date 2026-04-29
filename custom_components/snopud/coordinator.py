@@ -51,6 +51,7 @@ restart.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, datetime, timedelta, timezone
 
@@ -89,6 +90,7 @@ from .const import (
     MIN_BACKFILL_DAYS,
     MIN_SCAN_INTERVAL_MINUTES,
     SENSOR_LOOKBACK_DAYS,
+    SENSOR_RECENT_INTERVAL_LIMIT,
 )
 from .green_button import GreenButtonFeed, IntervalReading, parse_green_button
 from .snopud_client import (
@@ -186,6 +188,18 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # don't double-count the recent 15-minute rolling window — see
         # ``_seed_cumulative_from_stats``.
         self._last_seen_cumulative: dict[str, datetime] = {}
+        # Per-meter rolling window of recently-seen 15-minute interval buckets,
+        # keyed by ISO-formatted start timestamp so dedup-by-start is O(1).
+        # Populated from each refresh's parsed 15-min feed (filtered to actual
+        # 900-second slices) and trimmed to ``SENSOR_RECENT_INTERVAL_LIMIT``
+        # most-recent entries. This is the source for the sensor's
+        # ``recent_intervals`` extra-state attribute. We carry the dict across
+        # refreshes so a single export that surfaces multiple new buckets at
+        # once (the SnoPUD lag pattern: at 8 PM the export reveals 10 AM–noon
+        # intervals all at once) merges into the existing window instead of
+        # overwriting it. The window naturally rolls forward as new intervals
+        # arrive and the trim step drops the oldest.
+        self._recent_intervals_by_start: dict[str, dict[str, dict[str, Any]]] = {}
         # Circuit breaker state. After repeated auth failures we stop trying
         # until the config entry is reloaded, so a rotated password doesn't
         # cause us to repeatedly submit wrong credentials.
@@ -342,10 +356,17 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
           following refresh without requiring a separate force-reseed
           path.
 
-        We block on the recorder's queue draining first so that any LTS
-        writes scheduled earlier in the same refresh are visible to this
-        read — without that block the read can outrun a recently-queued
-        write and seed from a stale ``sum``.
+        We try to drain the recorder's queue first so that any LTS writes
+        scheduled earlier in the same refresh are visible to this read —
+        without that drain the read can outrun a recently-queued write and
+        seed from a stale ``sum``. The drain is bounded by a short timeout
+        because during HA bootstrap the recorder's own worker may not have
+        finished starting up; ``async_block_till_done`` will then wait
+        forever for a queue that nobody is draining, deadlocking the
+        integration's first refresh and tripping HA's stage-2 setup timeout.
+        On timeout we proceed without the drain — the seed will read
+        whatever is currently persisted, and the unlatched re-seed on the
+        next refresh self-heals from any stale read.
         """
         recorder = get_instance(self.hass)
         # Drain any pending recorder tasks (specifically the
@@ -357,7 +378,19 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         block_till_done = getattr(recorder, "async_block_till_done", None)
         if callable(block_till_done):
             try:
-                await block_till_done()
+                # Bounded so a not-yet-ready recorder worker (typical during
+                # HA bootstrap) can't deadlock our first refresh. 5s is well
+                # above the time a healthy queue takes to drain, and well
+                # under HA's 5-minute stage-2 setup timeout.
+                await asyncio.wait_for(block_till_done(), timeout=5.0)
+            except asyncio.TimeoutError:
+                _LOGGER.debug(
+                    "recorder block_till_done() timed out for %s; "
+                    "proceeding with seed read against current persisted "
+                    "stats. Next refresh will re-seed and self-heal if "
+                    "this read was stale.",
+                    account_number,
+                )
             except Exception:  # noqa: BLE001 — never fail seed on block error
                 pass
 
@@ -415,6 +448,71 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 account_number, kwh_seed, cost_seed,
                 kwh_last_start.isoformat() if kwh_last_start else None,
             )
+
+    def _merge_recent_intervals(
+        self,
+        account_number: str,
+        readings: list[IntervalReading],
+    ) -> list[dict[str, Any]]:
+        """Merge a fresh batch of 15-minute readings into the rolling window.
+
+        Critical SnoPUD-lag behaviour: a single refresh's parsed feed may
+        surface several brand-new 15-minute buckets at once (e.g. at 8 PM the
+        export newly contains 10 AM, 10:15 AM, 10:30 AM, …). We must include
+        every newly-discovered bucket, not just the latest one, so the
+        downstream ApexCharts bar graph fills in gaps as the portal catches
+        up. We do this by:
+
+        * keying the rolling window by ``start.isoformat()`` (one entry per
+          original SnoPUD interval timestamp — natural dedup),
+        * iterating every parsed reading and inserting/overwriting the entry
+          for that start (newer fetch wins, in case SnoPUD revises a value),
+        * sorting chronologically and trimming to
+          ``SENSOR_RECENT_INTERVAL_LIMIT`` most-recent entries.
+
+        Only true 15-minute slices are accepted into the window (we skip any
+        ``duration_seconds`` ≠ 900 reading, which protects us when the
+        sensor-feed fetch fell back to the hourly feed because 15-min
+        download failed — those hourly readings already drive the LTS path
+        and would otherwise pollute the bar chart with hour-long buckets).
+
+        Returns the freshly-built sorted list (most-recent last) for direct
+        use as the sensor entity's ``recent_intervals`` attribute.
+        """
+        store = self._recent_intervals_by_start.setdefault(account_number, {})
+
+        for r in readings:
+            # Reject anything that isn't a true 15-minute slice. The bar
+            # graph's semantics are "kWh consumed during this 15-minute
+            # window", so an hourly fallback reading would silently inflate
+            # one bar by 4×.
+            if r.duration_seconds != 900:
+                continue
+            start_iso = r.start.isoformat()
+            entry: dict[str, Any] = {
+                "start": start_iso,
+                "end": r.end.isoformat(),
+                # Round to mWh precision — meters report in integer Wh, so
+                # 3 decimals is exact for any reading ≤ 1 MWh while keeping
+                # the attribute payload compact.
+                "kwh": round(r.value_kwh, 3),
+            }
+            if r.cost_cents is not None:
+                entry["cost_usd"] = round(r.cost_cents / 100.0, 4)
+            store[start_iso] = entry
+
+        # Sort by ISO start (lex-sortable since they're tz-aware UTC strings
+        # of fixed length), then trim to the rolling window.
+        sorted_items = sorted(store.values(), key=lambda item: item["start"])
+        if len(sorted_items) > SENSOR_RECENT_INTERVAL_LIMIT:
+            trimmed = sorted_items[-SENSOR_RECENT_INTERVAL_LIMIT:]
+            # Rebuild the backing store from the trimmed list so it doesn't
+            # grow unboundedly across refreshes.
+            self._recent_intervals_by_start[account_number] = {
+                item["start"]: item for item in trimmed
+            }
+            return trimmed
+        return sorted_items
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch latest readings for each configured meter and import to statistics."""
@@ -545,10 +643,53 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 self._advance_cumulative(meter.account_number, advance_readings)
 
+                # Build the rolling 15-minute interval window for the sensor's
+                # ``recent_intervals`` attribute. We feed it the *parsed*
+                # sensor feed (which may legitimately surface multiple new
+                # buckets per refresh thanks to SnoPUD's 6–8h portal lag).
+                # The merge step deduplicates by interval start, so re-pulling
+                # an overlapping rolling window each refresh is safe.
+                recent_intervals = self._merge_recent_intervals(
+                    meter.account_number, sensor_feed.readings
+                )
+
                 last = (
                     sensor_feed.readings[-1] if sensor_feed.readings
                     else (hourly_feed.readings[-1] if hourly_feed.readings else None)
                 )
+                # Latest 15-minute interval — the sensor's published state.
+                # Fall back to the hourly slice only when the 15-min path
+                # produced nothing this cycle (download failure); we mark it
+                # explicitly so consumers can tell the difference.
+                latest_15min = (
+                    sensor_feed.readings[-1] if sensor_feed.readings else None
+                )
+                latest_interval_start = (
+                    latest_15min.start.isoformat() if latest_15min else None
+                )
+                latest_interval_end = (
+                    latest_15min.end.isoformat() if latest_15min else None
+                )
+                latest_interval_kwh = (
+                    round(latest_15min.value_kwh, 3) if latest_15min else None
+                )
+                latest_interval_cost = (
+                    round(latest_15min.cost_cents / 100.0, 4)
+                    if latest_15min and latest_15min.cost_cents is not None
+                    else None
+                )
+                # Lag (in minutes) between "now" and the end of the latest
+                # interval — useful for diagnostics and for templates that
+                # want to highlight stale data. End time, not start, because
+                # a complete 15-min slice is only published after the
+                # interval has closed.
+                if latest_15min is not None:
+                    now = datetime.now(timezone.utc)
+                    delta = now - latest_15min.end
+                    data_lag_minutes = max(0, int(delta.total_seconds() // 60))
+                else:
+                    data_lag_minutes = None
+
                 result["meters"][meter.account_number] = {
                     "internal_id": meter.internal_id,
                     "rate_schedule": meter.rate_schedule,
@@ -560,6 +701,14 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "latest_reading_cost": (
                         last.value_dollars if last and last.cost_cents is not None else None
                     ),
+                    # === New 15-minute sensor surface (v0.2.7+) ===========
+                    "latest_interval_start": latest_interval_start,
+                    "latest_interval_end": latest_interval_end,
+                    "latest_interval_kwh": latest_interval_kwh,
+                    "latest_interval_cost_usd": latest_interval_cost,
+                    "data_lag_minutes": data_lag_minutes,
+                    "recent_intervals": recent_intervals,
+                    # ======================================================
                     "cumulative_kwh": self._cumulative_kwh[meter.account_number],
                     "cumulative_cost_usd": self._cumulative_cost_usd[meter.account_number],
                 }

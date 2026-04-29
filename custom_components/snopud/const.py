@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 DOMAIN = "snopud"
-VERSION = "0.2.4"
+VERSION = "0.2.8"
 
 # Integration config keys (entry.data)
 CONF_EMAIL = "email"
@@ -82,6 +82,15 @@ DEFAULT_SENSOR_INTERVAL = INTERVAL_15MIN
 # lags 5–8 h, so a 3-day look-back is enough to fill in late-arriving data
 # while keeping payloads small.
 SENSOR_LOOKBACK_DAYS = 3
+# How many 15-minute interval buckets to retain in the sensor's
+# ``recent_intervals`` extra-state attribute. 4 intervals/hour × 24 h × 2 days
+# = 192 — enough for a 48-hour ApexCharts bar chart without bloating the HA
+# recorder's state-attribute storage. The window is rolling: each refresh
+# merges newly-discovered buckets into the existing set (deduped by start
+# timestamp) and trims the oldest entries beyond this limit. Tune up if you
+# need a longer dashboard window; for indefinite history use the hourly
+# long-term statistics path instead.
+SENSOR_RECENT_INTERVAL_LIMIT = 192
 # Legacy single-knob default (kept for tests that exercise the old path).
 DEFAULT_SELECTED_INTERVAL = DEFAULT_STATISTICS_INTERVAL
 DEFAULT_INTERVAL_SECONDS = 3600
