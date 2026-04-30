@@ -363,6 +363,15 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Failures are logged but never propagated; a write error doesn't
         invalidate the in-memory data and the next refresh will retry the
         write naturally.
+
+        No ``asyncio.Lock`` is needed around the dict traversal + save:
+        ``DataUpdateCoordinator`` serializes ``_async_update_data`` calls
+        internally — a manual ``async_request_refresh`` while a scheduled
+        refresh is in flight folds into the existing in-flight job rather
+        than spawning a concurrent one, so two refreshes never mutate
+        ``_recent_intervals_by_start`` at the same time. The dict iteration
+        below is therefore safe across the ``await async_save`` suspension
+        point.
         """
         meters_payload: dict[str, list[dict[str, Any]]] = {}
         for account, by_start in self._recent_intervals_by_start.items():

@@ -116,6 +116,22 @@ ARCHIVE_INTERVAL_LIMIT = 1344
 # schema ever changes incompatibly so older data gets rebuilt cleanly via the
 # one-shot backfill path on next setup.
 ARCHIVE_STORAGE_VERSION = 1
+
+# Sanity check: the archive must hold at least as many buckets as the sensor
+# attribute exposes. ``_merge_recent_intervals`` trims the backing dict to
+# ``ARCHIVE_INTERVAL_LIMIT`` and *then* slices the last
+# ``SENSOR_RECENT_INTERVAL_LIMIT`` entries for the entity attribute — if a
+# user edits these knobs and inverts the relationship, the slice silently
+# truncates the chart with no error. Failing fast at import time with a
+# clear message is much friendlier than a quietly-broken dashboard.
+if ARCHIVE_INTERVAL_LIMIT < SENSOR_RECENT_INTERVAL_LIMIT:
+    raise ValueError(
+        f"ARCHIVE_INTERVAL_LIMIT ({ARCHIVE_INTERVAL_LIMIT}) must be >= "
+        f"SENSOR_RECENT_INTERVAL_LIMIT ({SENSOR_RECENT_INTERVAL_LIMIT}); "
+        f"otherwise the entity attribute slice would truncate the chart "
+        f"window. Adjust the constants in const.py so the archive is at "
+        f"least as large as the chart window."
+    )
 # Legacy single-knob default (kept for tests that exercise the old path).
 DEFAULT_SELECTED_INTERVAL = DEFAULT_STATISTICS_INTERVAL
 DEFAULT_INTERVAL_SECONDS = 3600
