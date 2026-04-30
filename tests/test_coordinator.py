@@ -129,6 +129,31 @@ def _install_ha_stubs() -> None:
     uc.UpdateFailed = _UpdateFailed
     sys.modules["homeassistant.helpers.update_coordinator"] = uc
 
+    storage = types.ModuleType("homeassistant.helpers.storage")
+
+    class _Store:
+        """Stub of HA's helpers.storage.Store — backs onto an in-memory dict.
+
+        Tests that exercise the load/save round-trip can either reach into
+        ``Store._payload`` directly or replace the bound ``async_load``/
+        ``async_save`` on a coordinator's archive store with custom mocks.
+        """
+
+        def __init__(self, hass, version, key, **kwargs):
+            self.hass = hass
+            self.version = version
+            self.key = key
+            self._payload: Any = None
+
+        async def async_load(self) -> Any:
+            return self._payload
+
+        async def async_save(self, data: Any) -> None:
+            self._payload = data
+
+    storage.Store = _Store
+    sys.modules["homeassistant.helpers.storage"] = storage
+
 
 _install_ha_stubs()
 # Also stub out the statistics module (which imports more HA bits we don't
@@ -195,6 +220,13 @@ def _make_coord() -> "SnoPUDCoordinator":
     c._last_seen_cumulative = {}
     # State for ``_merge_recent_intervals`` (added in v0.2.7).
     c._recent_intervals_by_start = {}
+    # State for the persisted archive (added in v0.2.9). The Store stub is
+    # the in-memory ``_Store`` from ``_install_ha_stubs``.
+    storage_mod = sys.modules["homeassistant.helpers.storage"]
+    c._archive_store = storage_mod.Store(
+        hass=None, version=1, key="snopud_test_archive"
+    )
+    c._archived_meters = set()
     return c
 
 
@@ -567,11 +599,12 @@ def test_hourly_end_epsilon_math() -> None:
 # recent_intervals merge (v0.2.7+)
 # ---------------------------------------------------------------------------
 
-# Pull the limit from the loaded const module rather than re-defining it, so a
-# future change to the constant flows through the tests automatically.
-SENSOR_RECENT_INTERVAL_LIMIT = sys.modules[
-    "custom_components.snopud.const"
-].SENSOR_RECENT_INTERVAL_LIMIT
+# Pull the limits from the loaded const module rather than re-defining them,
+# so a future change to the constants flows through the tests automatically.
+_const = sys.modules["custom_components.snopud.const"]
+SENSOR_RECENT_INTERVAL_LIMIT = _const.SENSOR_RECENT_INTERVAL_LIMIT
+ARCHIVE_INTERVAL_LIMIT = _const.ARCHIVE_INTERVAL_LIMIT
+SENSOR_INITIAL_BACKFILL_DAYS = _const.SENSOR_INITIAL_BACKFILL_DAYS
 
 
 def test_merge_recent_intervals_includes_every_new_bucket() -> None:
@@ -655,14 +688,21 @@ def test_merge_recent_intervals_dedups_by_start_across_refreshes() -> None:
     print("✓ recent_intervals dedups by start across refreshes; new wins")
 
 
-def test_merge_recent_intervals_trims_to_retention_limit() -> None:
-    """When the rolling window exceeds ``SENSOR_RECENT_INTERVAL_LIMIT``, the
-    oldest entries are dropped — and the in-memory backing dict is rebuilt
-    so it doesn't leak memory across refreshes."""
+def test_merge_recent_intervals_two_tier_trim() -> None:
+    """v0.2.9 two-tier retention.
+
+    The backing in-memory dict (and the on-disk persisted archive) is bounded
+    by ``ARCHIVE_INTERVAL_LIMIT`` — a larger value (14 days by default).
+    The returned list (consumed by the entity's ``recent_intervals``
+    attribute) is bounded by ``SENSOR_RECENT_INTERVAL_LIMIT`` — a smaller
+    value (7 days by default), to keep recorder bloat bounded.
+
+    Feed in (ARCHIVE_LIMIT + 50) consecutive readings and verify both
+    invariants hold simultaneously.
+    """
     c = _make_coord()
-    # Fabricate (LIMIT + 50) consecutive 15-min readings.
     base = datetime(2026, 4, 22, 0, 0, tzinfo=timezone.utc)
-    n = SENSOR_RECENT_INTERVAL_LIMIT + 50
+    n = ARCHIVE_INTERVAL_LIMIT + 50
     feed = [
         IntervalReading(
             start=base + timedelta(minutes=15 * i),
@@ -672,18 +712,29 @@ def test_merge_recent_intervals_trims_to_retention_limit() -> None:
         for i in range(n)
     ]
     out = c._merge_recent_intervals("ACCT", feed)
+
+    # Returned list (entity attribute) trimmed to the smaller exposure cap.
     assert len(out) == SENSOR_RECENT_INTERVAL_LIMIT, (
-        f"expected output trimmed to {SENSOR_RECENT_INTERVAL_LIMIT}, got "
+        f"expected returned list trimmed to "
+        f"{SENSOR_RECENT_INTERVAL_LIMIT} (entity exposure cap), got "
         f"{len(out)}"
     )
-    # The retained slice is the most-recent ``LIMIT`` entries, in order.
-    assert out[0]["start"] == feed[50].start.isoformat(), (
-        "expected the oldest 50 buckets to be dropped"
-    )
+    # Returned list ends at the most recent reading.
     assert out[-1]["start"] == feed[-1].start.isoformat()
-    # And the backing dict was rebuilt to the trimmed set, not the full set.
-    assert len(c._recent_intervals_by_start["ACCT"]) == SENSOR_RECENT_INTERVAL_LIMIT
-    print("✓ recent_intervals trims to retention limit and rebuilds backing dict")
+    # And starts ``SENSOR_RECENT_INTERVAL_LIMIT`` from the end.
+    assert out[0]["start"] == feed[n - SENSOR_RECENT_INTERVAL_LIMIT].start.isoformat()
+
+    # Backing dict trimmed to the larger archive cap, not the smaller
+    # exposure cap. The extra (ARCHIVE_LIMIT - SENSOR_LIMIT) entries are
+    # retained for restart resilience but not exposed in the entity attr.
+    assert len(c._recent_intervals_by_start["ACCT"]) == ARCHIVE_INTERVAL_LIMIT, (
+        f"expected backing dict trimmed to {ARCHIVE_INTERVAL_LIMIT} "
+        f"(archive cap), got {len(c._recent_intervals_by_start['ACCT'])}"
+    )
+    print(
+        f"✓ two-tier trim: backing dict={ARCHIVE_INTERVAL_LIMIT}, "
+        f"exposed={SENSOR_RECENT_INTERVAL_LIMIT}"
+    )
 
 
 def test_merge_recent_intervals_skips_non_15min_readings() -> None:
@@ -729,6 +780,154 @@ def test_merge_recent_intervals_carries_cost_when_present() -> None:
     assert out[0]["cost_usd"] == 0.12
     assert "cost_usd" not in out[1]
     print("✓ recent_intervals carries cost_usd only when present in feed")
+
+
+# ---------------------------------------------------------------------------
+# Persisted archive (v0.2.9)
+# ---------------------------------------------------------------------------
+
+def test_save_archive_writes_full_dict_to_store() -> None:
+    """``_save_archive`` serializes every meter's full backing dict (up to
+    ARCHIVE_INTERVAL_LIMIT) to the Store, sorted by start. The persisted
+    shape is ``{"meters": {account: [bucket, ...]}}``."""
+    c = _make_coord()
+    feed_a = [_reading(10, m) for m in (0, 15, 30, 45)]
+    feed_b = [_reading(11, m) for m in (0, 15, 30, 45)]
+    c._merge_recent_intervals("ACCT_A", feed_a)
+    c._merge_recent_intervals("ACCT_B", feed_b)
+
+    asyncio.run(c._save_archive())
+
+    payload = c._archive_store._payload
+    assert isinstance(payload, dict) and "meters" in payload
+    meters = payload["meters"]
+    assert set(meters.keys()) == {"ACCT_A", "ACCT_B"}
+    # Each meter's list is sorted chronologically.
+    for items in meters.values():
+        starts = [item["start"] for item in items]
+        assert starts == sorted(starts)
+    # ACCT_A has all four buckets, none lost.
+    assert len(meters["ACCT_A"]) == 4
+    assert meters["ACCT_A"][0]["kwh"] == 0.250
+    print("✓ _save_archive writes per-meter sorted lists to Store")
+
+
+def test_load_archive_rehydrates_backing_dict_and_marks_meters() -> None:
+    """``async_load_archive`` reads the persisted JSON, rehydrates
+    ``_recent_intervals_by_start``, and adds each meter to
+    ``_archived_meters`` so the steady-state path runs (instead of the
+    one-shot backfill) for those meters on the next refresh."""
+    c = _make_coord()
+    # Pre-seed the in-memory Store as if a prior refresh had saved it.
+    c._archive_store._payload = {
+        "meters": {
+            "ACCT_A": [
+                {"start": "2026-04-22T10:00:00+00:00",
+                 "end":   "2026-04-22T10:15:00+00:00", "kwh": 0.333},
+                {"start": "2026-04-22T10:15:00+00:00",
+                 "end":   "2026-04-22T10:30:00+00:00", "kwh": 0.310},
+            ],
+        }
+    }
+
+    asyncio.run(c.async_load_archive())
+
+    assert "ACCT_A" in c._archived_meters
+    by_start = c._recent_intervals_by_start["ACCT_A"]
+    assert "2026-04-22T10:00:00+00:00" in by_start
+    assert "2026-04-22T10:15:00+00:00" in by_start
+    assert by_start["2026-04-22T10:00:00+00:00"]["kwh"] == 0.333
+    print("✓ async_load_archive rehydrates dict + marks meters archived")
+
+
+def test_load_archive_survives_missing_file() -> None:
+    """A fresh install (Store returns None) must not raise — the dict stays
+    empty, ``_archived_meters`` stays empty, and the next refresh's
+    one-shot backfill repopulates from SnoPUD."""
+    c = _make_coord()
+    c._archive_store._payload = None  # Store returns None on no-file
+    asyncio.run(c.async_load_archive())
+    assert c._recent_intervals_by_start == {}
+    assert c._archived_meters == set()
+    print("✓ async_load_archive handles missing-file case (fresh install)")
+
+
+def test_load_archive_survives_malformed_payload() -> None:
+    """A corrupted payload (wrong shape) must not raise — same fallback
+    behaviour as missing-file."""
+    c = _make_coord()
+    # "meters" should be a dict, not a list.
+    c._archive_store._payload = {"meters": ["nonsense"]}
+    asyncio.run(c.async_load_archive())
+    assert c._recent_intervals_by_start == {}
+    assert c._archived_meters == set()
+
+    # Inner items that aren't dicts, or dicts missing required fields, are
+    # silently dropped — the load doesn't raise and other meters' data
+    # is preserved.
+    c2 = _make_coord()
+    c2._archive_store._payload = {
+        "meters": {
+            "ACCT_A": [
+                {"start": "2026-04-22T10:00:00+00:00", "kwh": 0.333},  # ok
+                {"start": "2026-04-22T10:15:00+00:00"},                # no kwh, drop
+                "not-a-dict",                                           # drop
+                {"end": "2026-04-22T10:45:00+00:00", "kwh": 0.4},      # no start, drop
+            ],
+        }
+    }
+    asyncio.run(c2.async_load_archive())
+    assert "ACCT_A" in c2._archived_meters
+    assert len(c2._recent_intervals_by_start["ACCT_A"]) == 1
+    print("✓ async_load_archive tolerates malformed entries")
+
+
+def test_load_archive_then_merge_extends_window() -> None:
+    """End-to-end: load a pre-populated archive, then merge a fresh refresh's
+    readings on top. The result must include both the loaded buckets AND the
+    new ones, with no duplicates and chronologically ordered.
+
+    This is the restart-resilience guarantee: HA boots up, loads the
+    archive, the first refresh's small lookback adds today's new buckets,
+    and the chart immediately shows the full window without needing to
+    re-fetch a week of data from SnoPUD.
+    """
+    c = _make_coord()
+    # Pre-seed: 4 buckets from yesterday.
+    c._archive_store._payload = {
+        "meters": {
+            "ACCT": [
+                {"start": "2026-04-21T22:00:00+00:00",
+                 "end":   "2026-04-21T22:15:00+00:00", "kwh": 0.100},
+                {"start": "2026-04-21T22:15:00+00:00",
+                 "end":   "2026-04-21T22:30:00+00:00", "kwh": 0.110},
+                {"start": "2026-04-21T22:30:00+00:00",
+                 "end":   "2026-04-21T22:45:00+00:00", "kwh": 0.120},
+                {"start": "2026-04-21T22:45:00+00:00",
+                 "end":   "2026-04-21T23:00:00+00:00", "kwh": 0.130},
+            ],
+        }
+    }
+    asyncio.run(c.async_load_archive())
+
+    # Now a refresh comes in with two new buckets.
+    new_feed = [
+        IntervalReading(
+            start=datetime(2026, 4, 22, 0, 0, tzinfo=timezone.utc),
+            duration_seconds=900, value_wh=200,
+        ),
+        IntervalReading(
+            start=datetime(2026, 4, 22, 0, 15, tzinfo=timezone.utc),
+            duration_seconds=900, value_wh=210,
+        ),
+    ]
+    out = c._merge_recent_intervals("ACCT", new_feed)
+    assert len(out) == 6, (
+        f"expected 4 archived + 2 new = 6 buckets, got {len(out)}"
+    )
+    assert out[0]["kwh"] == 0.100   # oldest archived
+    assert out[-1]["kwh"] == 0.210  # newest from this refresh
+    print("✓ load + merge: archived buckets + new buckets coexist")
 
 
 # ---------------------------------------------------------------------------
@@ -837,8 +1036,13 @@ if __name__ == "__main__":
     test_seed_cumulative_self_heals_from_stale_initial_read()
     test_merge_recent_intervals_includes_every_new_bucket()
     test_merge_recent_intervals_dedups_by_start_across_refreshes()
-    test_merge_recent_intervals_trims_to_retention_limit()
+    test_merge_recent_intervals_two_tier_trim()
     test_merge_recent_intervals_skips_non_15min_readings()
     test_merge_recent_intervals_carries_cost_when_present()
+    test_save_archive_writes_full_dict_to_store()
+    test_load_archive_rehydrates_backing_dict_and_marks_meters()
+    test_load_archive_survives_missing_file()
+    test_load_archive_survives_malformed_payload()
+    test_load_archive_then_merge_extends_window()
     test_seed_proceeds_when_recorder_block_till_done_hangs()
     print("\nall coordinator tests passed")

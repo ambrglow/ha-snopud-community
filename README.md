@@ -254,7 +254,7 @@ substituted for each other.
 | Semantics | cumulative `sum`, monotonic | latest available per-interval kWh, varies up and down |
 | State class | n/a (external statistic) | `measurement` |
 | Source-timestamp alignment | yes — each row is keyed on the original SnoPUD hour boundary | yes for the `recent_intervals` attribute (each item carries its original Green Button interval `start`); **no** for the entity's HA state history (HA records state at refresh time, not at the original interval time) |
-| Retained | indefinitely (long-term statistics) | rolling 48-hour window in `attributes.recent_intervals` (192 buckets); the entity's HA state history is governed by HA's recorder retention but, as noted above, it is not aligned to the original SnoPUD interval times |
+| Retained | indefinitely (long-term statistics) | rolling 7-day window in `attributes.recent_intervals` (672 buckets, persisted to disk so it survives HA restarts; backed by a 14-day on-disk archive that can survive multi-day outages); the entity's HA state history is governed by HA's recorder retention but, as noted above, it is not aligned to the original SnoPUD interval times |
 | Use it for | **Energy Dashboard**, daily/weekly/monthly/yearly totals, anything billing-shaped | "latest available 15-min interval" displays and automations; aligned 15-min bar charts via `recent_intervals` and a chart card such as ApexCharts |
 | **Do not** use it for | as a substitute for the 15-minute sensor when you want fine-grain detail | as the Energy Dashboard source; as a Utility Meter source; as the source for any "aligned 15-minute history" view via state history alone |
 
@@ -330,11 +330,15 @@ attributes:
 ```
 
 Every bucket newly surfaced by the latest refresh is merged into this set
-(deduped by `start`, sorted chronologically, trimmed to the most recent
-192 entries — 48 hours of 15-min data). A dashboard card reads the array
-and plots bars at the *original* SnoPUD timestamps, not at HA's polling
-time, so the chart looks correct regardless of how laggy or bursty the
-upstream feed is.
+(deduped by `start`, sorted chronologically). The most recent 672 entries
+(7 days of 15-min data) are exposed in the entity's `recent_intervals`
+attribute for the bar chart; up to 1344 entries (14 days) are kept in a
+persisted on-disk archive that survives HA restarts and integration
+reloads — see [How the persistent archive
+works](#how-the-persistent-archive-works) below. A dashboard card reads
+the attribute and plots bars at the *original* SnoPUD timestamps, not at
+HA's polling time, so the chart looks correct regardless of how laggy or
+bursty the upstream feed is.
 
 ### 15-minute bar chart card (ApexCharts)
 
@@ -352,7 +356,7 @@ header:
   show: true
   title: SnoPUD 15-Min Usage
   show_states: true
-graph_span: 48h
+graph_span: 7d
 span:
   end: minute
 apex_config:
@@ -412,16 +416,72 @@ experimentation or rough liveness checks, but the only aligned
 15-minute view that this integration provides is the `recent_intervals`
 attribute via a chart that plots each item by its own `start`.
 
-### Tuning the retention window
+### How the persistent archive works
 
-By default the sensor retains the most recent 192 buckets (48 h). To
-change that, edit `SENSOR_RECENT_INTERVAL_LIMIT` in `const.py`. Storing
-much more than this in entity attributes is discouraged — HA's recorder
-keeps a copy of every state-update's full attribute payload, so an
-unbounded `recent_intervals` would inflate recorder storage on every
-refresh. For longer 15-minute history, mirror the entity to an external
-timeseries store (InfluxDB, TimescaleDB) using HA's existing integrations,
-or use the indefinitely-retained hourly long-term statistics path.
+The 15-minute interval data is held in **two tiers**:
+
+| Tier | Where | Default size | Purpose |
+|---|---|---|---|
+| Chart window | Entity attribute `recent_intervals` | 672 buckets (7 days) | What dashboard cards (ApexCharts, Plotly) plot. HA's recorder copies this attribute payload on every state change, so it's deliberately bounded. |
+| Archive | On-disk JSON file managed by HA's `Store` helper | 1344 buckets (14 days) | Survives HA restarts, integration reloads, and HACS upgrades so the chart is populated immediately on next startup instead of needing to re-fetch a week of data from SnoPUD. |
+
+The archive is a single JSON file at
+`<config>/.storage/snopud_<entry_id>_archive`, written once per refresh
+and loaded once at startup. It lives outside HA's recorder database, so
+growing it doesn't bloat the recorder.
+
+**Lifecycle:**
+
+1. **Fresh install (or any refresh where the archive file is missing for
+   a meter):** the integration runs a one-shot 14-day chunked backfill
+   from SnoPUD (`SENSOR_INITIAL_BACKFILL_DAYS = 14`). The chart fills
+   immediately — you don't have to wait days for it to populate.
+2. **Steady state:** each refresh (default once per hour) asks SnoPUD for
+   only the most recent 1 day of 15-minute data
+   (`SENSOR_LOOKBACK_DAYS = 1`). The archive carries the rest of the
+   rolling window forward. The 1-day fetch is enough to cover SnoPUD's
+   6–8h portal lag plus a small cushion for short outages.
+3. **Restart resilience:** when HA restarts, the archive is loaded into
+   memory before the first refresh fires, so the entity is created with
+   the full 7-day chart window already populated. The first refresh then
+   merges the latest 1 day of data on top.
+4. **Extended outage recovery:** the archive's 14-day window means a
+   restart after up to ~13 days of HA downtime still rehydrates a full
+   chart, rather than truncating to whatever a single 1-day fetch can
+   recover.
+
+### Tuning the retention windows
+
+The two tiers are controlled by two constants in `const.py`:
+
+```python
+SENSOR_RECENT_INTERVAL_LIMIT = 672    # 7 days  (chart window)
+ARCHIVE_INTERVAL_LIMIT = 1344         # 14 days (on-disk archive)
+```
+
+To change the chart window, edit `SENSOR_RECENT_INTERVAL_LIMIT`. Each
+bucket in the entity attribute is ~150 bytes; HA's recorder records the
+full attributes payload on every refresh, so doubling this constant
+doubles the recorder's per-state-change write size. The default 672 ≈
+100 KB per refresh, which is comfortable. Pushing much beyond ~30 days
+(2880) starts to noticeably inflate recorder storage.
+
+To change the archive window, edit `ARCHIVE_INTERVAL_LIMIT`. The archive
+is one JSON file, not in the recorder, so this is essentially free in
+storage terms — at 14 days it's ~200 KB on disk. The archive must be ≥
+the chart window. Increasing `SENSOR_INITIAL_BACKFILL_DAYS` to match a
+larger archive size makes first-setup populate the chart with a longer
+window immediately rather than over the next several days.
+
+For 15-minute history beyond ~30 days, mirror the entity to an external
+timeseries store (InfluxDB, TimescaleDB) — but be aware that mirroring
+the *entity state history* inherits the same alignment caveat as the
+History Graph card (state updates are recorded at integration refresh
+time, not at the original interval time). Mirroring the
+`recent_intervals` *attribute* preserves alignment but introduces
+deduplication complexity. Most users will want to use the
+indefinitely-retained hourly long-term statistics path
+(`snopud:energy_consumption_<account>`) for long-range queries instead.
 
 ## How it works
 
@@ -429,27 +489,35 @@ or use the indefinitely-retained hourly long-term statistics path.
    a cookie-based session).
 2. Calls `/Usage/InitializeDownloadSettings` to enumerate meters and harvest
    the CSRF token the portal's own download form uses.
-3. For each configured meter, performs **two** Green Button downloads per
+3. On HA startup (before any entity is created), loads the persisted
+   15-minute interval archive from
+   `<config>/.storage/snopud_<entry_id>_archive` into memory. This is what
+   lets the dashboard chart appear with full history immediately rather
+   than waiting for SnoPUD to deliver enough buckets to repopulate.
+4. For each configured meter, performs **two** Green Button downloads per
    refresh cycle:
    - `SelectedInterval=5` (hourly) for the long-term-statistics feed,
      covering either the configured backfill window on first run or the
      last few days incrementally thereafter.
-   - `SelectedInterval=3` (15-minute) for the sensor entity, covering a
-     short rolling lookback so dashboards stay current.
+   - `SelectedInterval=3` (15-minute) for the sensor entity. On first
+     setup (or any refresh where the archive is missing for a meter)
+     this is a one-shot chunked 14-day backfill so the chart fills
+     immediately. In steady state it's just the last day — the
+     persisted archive carries the rest of the rolling window forward.
    Both calls submit the same body shape as the portal's own download form:
    `SelectedFormat=1` (Green Button XML), `SelectedUsageType=1` (kWh
    consumption), plus the requested `Start`/`End` date range.
-4. Parses each returned Atom feed's `IntervalReading` entries into kWh
+5. Parses each returned Atom feed's `IntervalReading` entries into kWh
    deltas (plus optional cost in USD).
-5. Writes the hourly readings into HA's recorder via
+6. Writes the hourly readings into HA's recorder via
    `async_add_external_statistics` (idempotent upsert keyed on
    `(statistic_id, start)`).
-6. Publishes the 15-minute readings to the per-meter sensor entity. The
-   sensor's state is the latest complete 15-minute interval's kWh value
-   (`state_class=measurement`), and the entity's `recent_intervals` extra
-   attribute carries a rolling window of every 15-minute bucket the
-   integration has seen (deduped by interval start, trimmed to the most
-   recent 192 buckets) — the data source for dashboard bar-chart cards.
+7. Merges the parsed 15-minute readings into the per-meter rolling
+   archive (deduped by interval start). Publishes the most recent 7 days
+   (672 buckets) as the sensor entity's `recent_intervals` extra
+   attribute — the data source for dashboard bar-chart cards. The full
+   14-day archive is then saved back to the on-disk JSON file for
+   restart resilience.
 
 If you enable the "Back-fill billing-interval history" option — either at
 setup or later from the integration's Configure menu — the integration
@@ -489,15 +557,21 @@ on every refresh.
      history and shouldn't be presented as one (see "The two data
      paths" above for the full explanation). The aligned 15-minute view
      lives in the entity's `attributes.recent_intervals` array — a
-     rolling 48-hour window of buckets keyed by their original SnoPUD
+     rolling 7-day window of buckets keyed by their original SnoPUD
      interval start timestamps, intended to be consumed by a chart card
-     such as ApexCharts. For longer-than-48-hour 15-minute history,
-     mirroring the entity to an external timeseries store (InfluxDB,
-     TimescaleDB, etc.) inherits the same alignment caveat, since the
-     mirror reads the entity's state at HA's polling time. The hourly
-     long-term-statistics path is the retained-forever feed and is
-     properly time-aligned at hour grain. The SnoPUD integration can't
-     change HA's recorder retention from its own config.
+     such as ApexCharts. The integration also keeps a 14-day on-disk
+     archive (single JSON file via HA's `Store` helper, outside the
+     recorder DB) so the chart populates immediately after HA restarts
+     or HACS upgrades — see [How the persistent archive
+     works](#how-the-persistent-archive-works) above. For 15-minute
+     history beyond ~30 days, mirror to an external timeseries store
+     (InfluxDB, TimescaleDB, etc.); be aware that mirroring the
+     entity's state inherits the same alignment caveat as state-history
+     consumers, while mirroring `recent_intervals` preserves alignment
+     but takes more setup. The hourly long-term-statistics path is the
+     retained-forever feed and is properly time-aligned at hour grain.
+     The SnoPUD integration can't change HA's recorder retention from
+     its own config.
 - **Max download window.** Empirical; the integration defaults to 90-day
   chunks. If you hit errors on backfill, lower `MAX_DOWNLOAD_WINDOW_DAYS` in
   `const.py`.
@@ -567,6 +641,68 @@ need the nuclear option:
   format.
 
 ## Changelog
+
+### v0.2.9 — persistent 15-minute archive, 7-day chart, smaller refresh footprint
+
+**What changed**
+
+* The 15-minute interval data is now held in two tiers (see [How the
+  persistent archive works](#how-the-persistent-archive-works) for full
+  details):
+  - **Chart window** — the entity's `recent_intervals` attribute exposes
+    the most recent **7 days** (672 buckets). The previous default was
+    48 hours.
+  - **On-disk archive** — a 14-day JSON archive
+    (`<config>/.storage/snopud_<entry_id>_archive`) survives HA
+    restarts, integration reloads, and HACS upgrades. The archive lives
+    outside HA's recorder DB so it doesn't bloat recorder storage.
+* **Steady-state SnoPUD fetches are smaller.** Per-refresh 15-minute
+  download is now 1 day (`SENSOR_LOOKBACK_DAYS = 1`), down from 3 days.
+  The persisted archive carries the rest of the rolling window forward
+  across refreshes, so the smaller fetch is sufficient — it just needs
+  to cover SnoPUD's 6–8h portal lag plus a small cushion. Net effect:
+  ~67% less data downloaded per refresh, while users see a ~3.5×
+  longer chart.
+* **First-setup populates the chart immediately.** On a fresh install
+  (or any refresh where the archive file is missing for a meter), the
+  integration runs a one-shot chunked 14-day backfill instead of
+  ramping up over the next two weeks as single-day fetches accumulate.
+* **Restart resilience.** When HA restarts, the archive is loaded into
+  memory before the first refresh, so the entity is created with the
+  full 7-day chart already populated. No empty-chart period during
+  startup.
+* **Two new constants in `const.py`:** `SENSOR_INITIAL_BACKFILL_DAYS`
+  (one-shot fill window, default 14) and `ARCHIVE_INTERVAL_LIMIT`
+  (on-disk archive cap, default 1344 buckets ≈ 14 days). Tuning
+  guidance is in the
+  [Tuning the retention windows](#tuning-the-retention-windows) section.
+
+**Why**
+
+Users wanted a longer dashboard window (a week of 15-minute usage is
+very useful for spotting weekly patterns), but cranking up
+`SENSOR_LOOKBACK_DAYS` would have meant fetching a week of data from
+SnoPUD on every hourly refresh — inefficient and pushing the portal's
+single-request size envelope. Persisting the rolling window separates
+"what we ask SnoPUD for" from "what users see in the chart": the fetch
+stays small while the chart can be much larger. The archive also lets
+the integration recover full chart history after HA outages, which the
+old design couldn't do without re-fetching from SnoPUD.
+
+**Action required after upgrading**
+
+* No action required for the Energy Dashboard — it reads the hourly
+  long-term statistic, unchanged.
+* No action required to use the new 7-day chart — your existing
+  ApexCharts card will pick up the longer window automatically. If you
+  want the card's visible span to match, change `graph_span: 48h` to
+  `graph_span: 7d` in your card YAML (the README example has been
+  updated).
+* Existing installs upgrading from v0.2.8 will run the one-shot 14-day
+  backfill on the first refresh after the upgrade (since the archive
+  file doesn't exist yet). Expect that first refresh to take a bit
+  longer than usual; subsequent refreshes return to the small 1-day
+  fetch.
 
 ### v0.2.8 — bound recorder block_till_done; ships v0.2.7 redesign
 

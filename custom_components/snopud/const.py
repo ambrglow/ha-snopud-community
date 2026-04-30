@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 DOMAIN = "snopud"
-VERSION = "0.2.8"
+VERSION = "0.2.9"
 
 # Integration config keys (entry.data)
 CONF_EMAIL = "email"
@@ -78,19 +78,44 @@ USAGE_TYPE_DOLLARS = "3"
 #     settings; hourly aggregates of it are also kept forever as auto-LTS.
 DEFAULT_STATISTICS_INTERVAL = INTERVAL_HOURLY
 DEFAULT_SENSOR_INTERVAL = INTERVAL_15MIN
-# How far back to fetch the 15-min sensor window on each refresh. The portal
-# lags 5–8 h, so a 3-day look-back is enough to fill in late-arriving data
-# while keeping payloads small.
-SENSOR_LOOKBACK_DAYS = 3
-# How many 15-minute interval buckets to retain in the sensor's
-# ``recent_intervals`` extra-state attribute. 4 intervals/hour × 24 h × 2 days
-# = 192 — enough for a 48-hour ApexCharts bar chart without bloating the HA
-# recorder's state-attribute storage. The window is rolling: each refresh
-# merges newly-discovered buckets into the existing set (deduped by start
-# timestamp) and trims the oldest entries beyond this limit. Tune up if you
-# need a longer dashboard window; for indefinite history use the hourly
-# long-term statistics path instead.
-SENSOR_RECENT_INTERVAL_LIMIT = 192
+# Steady-state 15-min fetch window per refresh. The portal lags 5–8 h, so a
+# 1-day look-back is more than enough to cover the right edge plus a small
+# cushion for short outages. The longer rolling window users actually see in
+# the chart is provided by the persisted archive (see ``ARCHIVE_INTERVAL_LIMIT``
+# below), not by re-fetching the same data on every refresh — keeping the
+# steady-state payload small. On a fresh install (or any refresh where the
+# persisted archive is missing for a meter) the integration runs a one-shot
+# ``SENSOR_INITIAL_BACKFILL_DAYS`` chunked backfill instead, so the chart is
+# populated immediately rather than ramping up over the next week.
+SENSOR_LOOKBACK_DAYS = 1
+# One-shot 15-min backfill window. Runs only when no persisted archive exists
+# for a meter (fresh install, archive file deleted, etc.). Sized to match
+# ``ARCHIVE_INTERVAL_LIMIT`` so first-setup immediately fills the persisted
+# archive, after which the steady-state 1-day lookback path takes over.
+# Chunked through ``_chunked_backfill`` so a single ~1300-bucket request
+# doesn't time out on the SnoPUD portal.
+SENSOR_INITIAL_BACKFILL_DAYS = 14
+# How many 15-minute interval buckets to expose in the sensor's
+# ``recent_intervals`` extra-state attribute. 4 intervals/hour × 24 h × 7 days
+# = 672 — a 7-day ApexCharts bar chart. Bounded modestly so the recorder's
+# per-state-change attribute payload stays small (HA writes the FULL
+# attributes payload on every state update; an unbounded ``recent_intervals``
+# would inflate recorder storage proportionally to the polling cadence).
+SENSOR_RECENT_INTERVAL_LIMIT = 672
+# How many 15-minute buckets to retain in the persisted on-disk archive,
+# independent of the entity attribute exposure. 4 × 24 × 14 = 1344, i.e. a
+# 14-day on-disk window. Must be ≥ ``SENSOR_RECENT_INTERVAL_LIMIT``. The
+# archive lives outside HA's recorder (single JSON file via the integration's
+# own ``Store``) so growing it doesn't bloat the recorder. The extra ~7 days
+# beyond the chart window exists to keep the chart populated across HA
+# downtime, integration reloads, or HACS upgrades — the archive seeds the
+# in-memory rolling window so a refresh after an outage doesn't need to
+# re-fetch a week of data from SnoPUD to repopulate the chart.
+ARCHIVE_INTERVAL_LIMIT = 1344
+# Storage layout version for the persisted archive JSON. Bump if the on-disk
+# schema ever changes incompatibly so older data gets rebuilt cleanly via the
+# one-shot backfill path on next setup.
+ARCHIVE_STORAGE_VERSION = 1
 # Legacy single-knob default (kept for tests that exercise the old path).
 DEFAULT_SELECTED_INTERVAL = DEFAULT_STATISTICS_INTERVAL
 DEFAULT_INTERVAL_SECONDS = 3600

@@ -69,9 +69,12 @@ from homeassistant.components.recorder.statistics import get_last_statistics
 from homeassistant.components.recorder.util import get_instance
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    ARCHIVE_INTERVAL_LIMIT,
+    ARCHIVE_STORAGE_VERSION,
     CONF_BACKFILL_DAYS,
     CONF_BACKFILLED_METERS,
     CONF_BILLING_BACKFILLED_METERS,
@@ -89,6 +92,7 @@ from .const import (
     MAX_SCAN_INTERVAL_MINUTES,
     MIN_BACKFILL_DAYS,
     MIN_SCAN_INTERVAL_MINUTES,
+    SENSOR_INITIAL_BACKFILL_DAYS,
     SENSOR_LOOKBACK_DAYS,
     SENSOR_RECENT_INTERVAL_LIMIT,
 )
@@ -191,15 +195,42 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Per-meter rolling window of recently-seen 15-minute interval buckets,
         # keyed by ISO-formatted start timestamp so dedup-by-start is O(1).
         # Populated from each refresh's parsed 15-min feed (filtered to actual
-        # 900-second slices) and trimmed to ``SENSOR_RECENT_INTERVAL_LIMIT``
-        # most-recent entries. This is the source for the sensor's
-        # ``recent_intervals`` extra-state attribute. We carry the dict across
-        # refreshes so a single export that surfaces multiple new buckets at
-        # once (the SnoPUD lag pattern: at 8 PM the export reveals 10 AM–noon
-        # intervals all at once) merges into the existing window instead of
-        # overwriting it. The window naturally rolls forward as new intervals
-        # arrive and the trim step drops the oldest.
+        # 900-second slices) and trimmed to ``ARCHIVE_INTERVAL_LIMIT``
+        # most-recent entries. The most recent ``SENSOR_RECENT_INTERVAL_LIMIT``
+        # entries are then exposed in the sensor's ``recent_intervals``
+        # extra-state attribute (the chart window); the rest stays in the
+        # backing store so it survives HA restarts and integration reloads.
+        # We carry the dict across refreshes so a single export that surfaces
+        # multiple new buckets at once (the SnoPUD lag pattern: at 8 PM the
+        # export reveals 10 AM–noon intervals all at once) merges into the
+        # existing window instead of overwriting it. The window naturally
+        # rolls forward as new intervals arrive and the trim step drops the
+        # oldest beyond the archive cap.
         self._recent_intervals_by_start: dict[str, dict[str, dict[str, Any]]] = {}
+        # Persistent on-disk archive of the per-meter rolling window. Loaded
+        # once during ``async_load_archive`` (called from ``async_setup_entry``
+        # before the first refresh) so the chart is populated immediately on
+        # HA restart instead of needing to re-fetch a week of data from
+        # SnoPUD. Saved after each successful refresh. The "archived" key
+        # space inside the JSON blob is meter account number → list of
+        # bucket dicts; we rehydrate that into the in-memory dict on load
+        # and serialize back to a list on save. Only the latest
+        # ``ARCHIVE_INTERVAL_LIMIT`` buckets per meter are persisted.
+        # ``Store`` writes to ``<config>/.storage/snopud_<entry_id>_archive``,
+        # which lives outside HA's recorder DB so growing the archive
+        # doesn't bloat the recorder.
+        self._archive_store: Store = Store(
+            hass,
+            ARCHIVE_STORAGE_VERSION,
+            f"{DOMAIN}_{entry.entry_id}_archive",
+        )
+        # Set of meter account numbers whose archive has been loaded into the
+        # in-memory dict. Used to gate the one-shot 15-min backfill: if a
+        # meter is missing from this set after archive load, the meter has
+        # never been seen at this entry (or its archive was deleted), and
+        # the next refresh runs ``_run_15min_backfill_if_needed`` to
+        # populate the chart immediately.
+        self._archived_meters: set[str] = set()
         # Circuit breaker state. After repeated auth failures we stop trying
         # until the config entry is reloaded, so a rotated password doesn't
         # cause us to repeatedly submit wrong credentials.
@@ -253,6 +284,101 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         new_options = {**self._entry.options, CONF_BILLING_BACKFILLED_METERS: new}
         self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+
+    async def async_load_archive(self) -> None:
+        """Load the persisted 15-minute interval archive from disk.
+
+        Called from ``async_setup_entry`` BEFORE
+        ``async_config_entry_first_refresh`` so the in-memory rolling window
+        is populated before the coordinator's first fetch — guaranteeing the
+        sensor entity has data to expose immediately on HA restart instead of
+        waiting for SnoPUD to deliver a full window of buckets.
+
+        The persisted JSON is keyed by meter account number → list of bucket
+        dicts. We rehydrate that into ``_recent_intervals_by_start`` and mark
+        each meter we found as "archived," so the steady-state 1-day fetch
+        path runs for those meters and the one-shot 14-day backfill path
+        only runs for meters whose archive is missing (fresh install, archive
+        deleted, etc.).
+
+        Failures are non-fatal: a corrupt or missing archive file simply
+        leaves the in-memory dict empty, and the next refresh's one-shot
+        backfill repopulates it from SnoPUD.
+        """
+        try:
+            data = await self._archive_store.async_load()
+        except Exception as err:  # noqa: BLE001 — never block setup on archive
+            _LOGGER.warning(
+                "could not load 15-min archive (%s); will rebuild on next "
+                "refresh via the one-shot backfill path",
+                err,
+            )
+            return
+        if not data:
+            # Brand-new install or fresh archive file — leave the dict empty;
+            # one-shot backfill will populate it on the first refresh.
+            return
+        meters = data.get("meters") or {}
+        if not isinstance(meters, dict):
+            _LOGGER.warning(
+                "15-min archive has unexpected shape (%s); ignoring and "
+                "rebuilding via the one-shot backfill path",
+                type(meters).__name__,
+            )
+            return
+        for account, items in meters.items():
+            if not isinstance(items, list):
+                continue
+            # Rehydrate {start_iso: bucket_dict}. Each item must carry at
+            # least ``start`` and ``kwh``; we drop malformed entries silently
+            # rather than failing the whole load.
+            by_start: dict[str, dict[str, Any]] = {}
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                start = item.get("start")
+                if not isinstance(start, str):
+                    continue
+                if "kwh" not in item:
+                    continue
+                by_start[start] = item
+            if by_start:
+                self._recent_intervals_by_start[account] = by_start
+                self._archived_meters.add(account)
+        if self._archived_meters:
+            _LOGGER.debug(
+                "loaded 15-min archive for %d meter(s): %s",
+                len(self._archived_meters),
+                ", ".join(sorted(self._archived_meters)),
+            )
+
+    async def _save_archive(self) -> None:
+        """Persist the in-memory 15-minute interval archive to disk.
+
+        Called once per refresh after all meters have been processed. The
+        on-disk shape is ``{"meters": {account: [bucket, ...]}}`` so it's
+        forward-compatible with future top-level keys (per-meter cursors,
+        etc.) without a schema bump.
+
+        Failures are logged but never propagated; a write error doesn't
+        invalidate the in-memory data and the next refresh will retry the
+        write naturally.
+        """
+        meters_payload: dict[str, list[dict[str, Any]]] = {}
+        for account, by_start in self._recent_intervals_by_start.items():
+            # Sort chronologically on save so the on-disk file is human-
+            # readable and so a manual JSON inspection shows a sensible order.
+            meters_payload[account] = sorted(
+                by_start.values(), key=lambda item: item["start"]
+            )
+        try:
+            await self._archive_store.async_save({"meters": meters_payload})
+        except Exception as err:  # noqa: BLE001 — never fail refresh on save
+            _LOGGER.warning(
+                "could not save 15-min archive (%s); in-memory dict still "
+                "valid for this session, will retry on next refresh",
+                err,
+            )
 
     async def _maybe_reset_backfill_for_widened_window(self) -> None:
         """If ``backfill_days`` has been raised since we last honored it,
@@ -456,6 +582,19 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> list[dict[str, Any]]:
         """Merge a fresh batch of 15-minute readings into the rolling window.
 
+        Two-tier retention:
+
+        * ``ARCHIVE_INTERVAL_LIMIT`` — the backing in-memory dict (and its
+          on-disk persisted copy via ``Store``) keeps this many entries per
+          meter. 14 days at 15-minute grain by default. Survives HA restarts
+          so the chart is immediately populated after a reboot without
+          needing to re-fetch from SnoPUD.
+        * ``SENSOR_RECENT_INTERVAL_LIMIT`` — the entity's ``recent_intervals``
+          extra-state attribute exposes only the most recent slice of the
+          archive (7 days by default). Bounded so HA's recorder, which
+          records the full attributes payload on every state change, doesn't
+          accumulate redundant data proportional to the polling cadence.
+
         Critical SnoPUD-lag behaviour: a single refresh's parsed feed may
         surface several brand-new 15-minute buckets at once (e.g. at 8 PM the
         export newly contains 10 AM, 10:15 AM, 10:30 AM, …). We must include
@@ -467,8 +606,10 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
           original SnoPUD interval timestamp — natural dedup),
         * iterating every parsed reading and inserting/overwriting the entry
           for that start (newer fetch wins, in case SnoPUD revises a value),
-        * sorting chronologically and trimming to
-          ``SENSOR_RECENT_INTERVAL_LIMIT`` most-recent entries.
+        * sorting chronologically and trimming the backing store to
+          ``ARCHIVE_INTERVAL_LIMIT`` most-recent entries,
+        * returning the latest ``SENSOR_RECENT_INTERVAL_LIMIT`` of those for
+          the entity attribute.
 
         Only true 15-minute slices are accepted into the window (we skip any
         ``duration_seconds`` ≠ 900 reading, which protects us when the
@@ -476,8 +617,9 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         download failed — those hourly readings already drive the LTS path
         and would otherwise pollute the bar chart with hour-long buckets).
 
-        Returns the freshly-built sorted list (most-recent last) for direct
-        use as the sensor entity's ``recent_intervals`` attribute.
+        Returns the freshly-built sorted list (most-recent last), trimmed to
+        the entity-attribute exposure window, for direct use as the sensor's
+        ``recent_intervals`` attribute.
         """
         store = self._recent_intervals_by_start.setdefault(account_number, {})
 
@@ -502,16 +644,25 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             store[start_iso] = entry
 
         # Sort by ISO start (lex-sortable since they're tz-aware UTC strings
-        # of fixed length), then trim to the rolling window.
+        # of fixed length), then trim the BACKING store to ARCHIVE_INTERVAL_LIMIT.
+        # The archive cap is what bounds the persisted JSON file size and the
+        # in-memory dict growth across refreshes.
         sorted_items = sorted(store.values(), key=lambda item: item["start"])
-        if len(sorted_items) > SENSOR_RECENT_INTERVAL_LIMIT:
-            trimmed = sorted_items[-SENSOR_RECENT_INTERVAL_LIMIT:]
+        if len(sorted_items) > ARCHIVE_INTERVAL_LIMIT:
+            sorted_items = sorted_items[-ARCHIVE_INTERVAL_LIMIT:]
             # Rebuild the backing store from the trimmed list so it doesn't
             # grow unboundedly across refreshes.
             self._recent_intervals_by_start[account_number] = {
-                item["start"]: item for item in trimmed
+                item["start"]: item for item in sorted_items
             }
-            return trimmed
+
+        # Now slice the most-recent SENSOR_RECENT_INTERVAL_LIMIT entries for
+        # entity-attribute exposure. The archive may be larger; we just don't
+        # surface the older buckets to the dashboard (keeps recorder bloat
+        # bounded). The full archive is still persisted to disk for restart
+        # resilience.
+        if len(sorted_items) > SENSOR_RECENT_INTERVAL_LIMIT:
+            return sorted_items[-SENSOR_RECENT_INTERVAL_LIMIT:]
         return sorted_items
 
     async def _async_update_data(self) -> dict[str, Any]:
@@ -721,6 +872,11 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Persist backfill state after a successful update cycle.
         await self._persist_backfilled()
         await self._persist_billing_backfilled()
+        # Save the rolling 15-min interval archive once per refresh, AFTER
+        # all meters have been merged into the in-memory dict. This is the
+        # write side of the persistence loop that ``async_load_archive``
+        # rehydrates on next startup.
+        await self._save_archive()
         return result
 
     def _advance_cumulative(
@@ -919,11 +1075,54 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> GreenButtonFeed:
         """15-min fetch — published as the sensor's state stream.
 
-        Always pulls a recent rolling window (no full backfill at this grain;
-        the hourly statistics path covers the historical view, and HA's
-        recorder will keep this sensor's state going forward subject to the
-        user's recorder retention settings).
+        Two paths:
+
+        * **First-setup / missing-archive (one-shot):** when this meter has
+          no entries in the loaded archive (``account_number not in
+          self._archived_meters``), the integration runs a chunked
+          ``SENSOR_INITIAL_BACKFILL_DAYS`` backfill so the chart fills
+          immediately instead of ramping up over the next 14 days as
+          single-day fetches accumulate. Latched on success: once a meter's
+          archive exists, the steady-state path takes over.
+        * **Steady state:** ``SENSOR_LOOKBACK_DAYS`` (default 1 day). The
+          persisted archive carries the rest of the rolling window forward
+          across refreshes, so each fetch only needs to cover SnoPUD's
+          6–8h portal lag plus a small safety cushion.
+
+        ``_chunked_backfill`` returns ``(merged_feed, completed)``; we
+        promote ``completed`` to a successful first-setup latch only when
+        the walk terminated cleanly. Partial completions (download error
+        mid-walk) leave ``account_number`` out of ``_archived_meters`` so
+        the next refresh retries the backfill — the merge layer is
+        idempotent on interval start, so already-fetched chunks won't be
+        re-counted.
         """
+        if meter.account_number not in self._archived_meters:
+            _LOGGER.info(
+                "performing one-shot %d-day 15-min backfill for meter %s "
+                "(no persisted archive)",
+                SENSOR_INITIAL_BACKFILL_DAYS, meter.account_number,
+            )
+            merged, completed = await self._chunked_backfill(
+                client, meter, all_meters, today,
+                interval=DEFAULT_SENSOR_INTERVAL,
+                total_days=SENSOR_INITIAL_BACKFILL_DAYS,
+            )
+            if completed:
+                # Latch on first successful walk. The save-after-refresh in
+                # ``_async_update_data`` then writes the archive to disk so
+                # subsequent restarts skip this branch entirely.
+                self._archived_meters.add(meter.account_number)
+            else:
+                _LOGGER.info(
+                    "one-shot 15-min backfill for meter %s partially "
+                    "completed (%d readings); will resume on next refresh",
+                    meter.account_number, len(merged.readings),
+                )
+            return merged
+
+        # Steady-state path: small rolling window, persisted archive carries
+        # the rest forward across refreshes.
         start = today - timedelta(days=SENSOR_LOOKBACK_DAYS)
         xml = await client.async_download_green_button(
             meter=meter,

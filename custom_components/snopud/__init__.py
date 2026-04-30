@@ -25,6 +25,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         meter_account_numbers=entry.data[CONF_METER_IDS],
     )
 
+    # Rehydrate the persisted 15-minute interval archive BEFORE the first
+    # refresh fires, so the in-memory rolling window is populated before any
+    # entity is created. This is what makes the dashboard chart appear with
+    # full history immediately on HA restart instead of waiting for SnoPUD to
+    # deliver enough buckets to repopulate. Failures here are non-fatal — the
+    # one-shot 14-day backfill path in the coordinator will repopulate from
+    # SnoPUD on the next refresh.
+    await coordinator.async_load_archive()
+
     # Initial refresh — failures surface a persistent notification and HA will
     # retry on its normal cadence.
     await coordinator.async_config_entry_first_refresh()
