@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 DOMAIN = "snopud"
-VERSION = "0.2.9"
+VERSION = "0.2.10"
 
 # Integration config keys (entry.data)
 CONF_EMAIL = "email"
@@ -97,10 +97,15 @@ SENSOR_LOOKBACK_DAYS = 1
 SENSOR_INITIAL_BACKFILL_DAYS = 14
 # How many 15-minute interval buckets to expose in the sensor's
 # ``recent_intervals`` extra-state attribute. 4 intervals/hour × 24 h × 7 days
-# = 672 — a 7-day ApexCharts bar chart. Bounded modestly so the recorder's
-# per-state-change attribute payload stays small (HA writes the FULL
-# attributes payload on every state update; an unbounded ``recent_intervals``
-# would inflate recorder storage proportionally to the polling cadence).
+# = 672 — a 7-day ApexCharts bar chart. The attribute is marked
+# ``_unrecorded_attributes`` on the sensor class (see ``sensor.py``) so the
+# recorder skips it on every state change — growing this constant does NOT
+# inflate recorder storage. The remaining cost is the in-memory live-state
+# payload that ships to subscribed clients (Lovelace, websocket consumers)
+# on each state update; at 672 buckets the payload is ~64 KB, well within
+# HA's per-state-change handling budget. Pushing much beyond ~30 days
+# (2880 buckets) is feasible but starts to feel sluggish in cards that
+# parse the array on every state change.
 SENSOR_RECENT_INTERVAL_LIMIT = 672
 # How many 15-minute buckets to retain in the persisted on-disk archive,
 # independent of the entity attribute exposure. 4 × 24 × 14 = 1344, i.e. a

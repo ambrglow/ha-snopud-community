@@ -600,9 +600,11 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
           needing to re-fetch from SnoPUD.
         * ``SENSOR_RECENT_INTERVAL_LIMIT`` — the entity's ``recent_intervals``
           extra-state attribute exposes only the most recent slice of the
-          archive (7 days by default). Bounded so HA's recorder, which
-          records the full attributes payload on every state change, doesn't
-          accumulate redundant data proportional to the polling cadence.
+          archive (7 days by default). The attribute is declared
+          ``_unrecorded_attributes`` on the sensor class so the recorder
+          skips it on every state change; the bound here is the live-state
+          payload size (~64 KB at 672 buckets) shipped to subscribed
+          clients on each state update, not recorder storage.
 
         Critical SnoPUD-lag behaviour: a single refresh's parsed feed may
         surface several brand-new 15-minute buckets at once (e.g. at 8 PM the
@@ -667,9 +669,10 @@ class SnoPUDCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Now slice the most-recent SENSOR_RECENT_INTERVAL_LIMIT entries for
         # entity-attribute exposure. The archive may be larger; we just don't
-        # surface the older buckets to the dashboard (keeps recorder bloat
-        # bounded). The full archive is still persisted to disk for restart
-        # resilience.
+        # surface the older buckets to the dashboard (keeps the live-state
+        # attribute payload bounded — see SENSOR_RECENT_INTERVAL_LIMIT in
+        # const.py for sizing notes). The full archive is still persisted
+        # to disk for restart resilience.
         if len(sorted_items) > SENSOR_RECENT_INTERVAL_LIMIT:
             return sorted_items[-SENSOR_RECENT_INTERVAL_LIMIT:]
         return sorted_items

@@ -11,21 +11,41 @@ This sensor is **not** a cumulative energy counter. Its state is the kWh
 *delivered during the most recent complete 15-minute interval*, and that
 value naturally rises and falls with consumption. We therefore use:
 
-    device_class = energy
-    state_class  = measurement       (NOT total_increasing)
-    unit         = kWh
+    state_class = measurement       (NOT total_increasing)
+    unit        = kWh
+    device_class = (deliberately omitted)
 
 A ``total_increasing`` state class would tell HA's statistics engine to
 treat the value as a meter reading that only ever resets, which is the
 opposite of what 15-minute interval consumption looks like.
 
-The Energy Dashboard's canonical feed is the parallel
+We DO NOT set ``device_class = energy``. As of HA's tightened sensor
+validation (Jan 2024), ``device_class=energy`` is incompatible with
+``state_class=measurement`` — it requires ``total_increasing`` or
+``total``. Since our value is a per-interval delta (not a monotonic
+counter), the right move is to drop the device class rather than lie
+about the semantics. The unit ``kWh`` still conveys what kind of value
+this is to dashboards and templates; only the device-class-driven
+auto-Energy-Dashboard wiring is forfeited, which is fine because the
+Energy Dashboard's canonical feed is the parallel
 ``snopud:energy_consumption_<account>`` external long-term statistic
-written by ``statistics.py`` from the **hourly** Green Button export. That
-path is unaffected by anything in this file. Users who want a monotonic
-kWh counter at 15-minute grain should wrap this sensor in HA's built-in
-**Utility Meter** helper — it integrates per-interval deltas into a proper
-cumulative for them.
+written by ``statistics.py`` from the **hourly** Green Button export.
+That path is unaffected by anything in this file. Users who want a
+monotonic kWh counter at 15-minute grain should wrap this sensor in HA's
+built-in **Utility Meter** helper — it integrates per-interval deltas
+into a proper cumulative for them.
+
+Recorder attribute size — ``recent_intervals``
+----------------------------------------------
+HA's recorder caps the persisted ``state_attributes`` JSON at 16 KB per
+state change. With 672 buckets at ~95 bytes each, ``recent_intervals``
+is ~64 KB and would trip the cap. We mark it as an **unrecorded
+attribute** via the class-level ``_unrecorded_attributes`` frozenset:
+the value still appears in the live entity state (so ApexCharts /
+Plotly cards reading ``state.attributes.recent_intervals`` work
+unchanged), but the recorder skips it when persisting state-attribute
+history. This keeps the recorder bound by the small set of recorded
+attributes while letting us expose a long rolling window to dashboards.
 
 Why a fresh unique_id
 ---------------------
@@ -62,7 +82,6 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.components.sensor import (
-    SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
 )
@@ -106,10 +125,22 @@ class SnoPUDLatest15MinSensor(CoordinatorEntity[SnoPUDCoordinator], SensorEntity
     """
 
     _attr_has_entity_name = True
-    _attr_device_class = SensorDeviceClass.ENERGY
+    # No device_class — see module docstring. ``device_class=energy`` is
+    # incompatible with ``state_class=measurement`` (HA tightened validation
+    # in Jan 2024 to require total_increasing/total for energy), and our
+    # value is a per-interval delta, not a cumulative counter, so
+    # ``measurement`` is the only honest choice.
     # MEASUREMENT, not TOTAL_INCREASING — see module docstring for why.
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = STATISTIC_UNIT_KWH
+    # Keep ``recent_intervals`` out of the recorder's state-attribute history.
+    # The list can be ~64 KB, well over the recorder's 16 KB attribute cap;
+    # without this, every refresh logs a "State attributes ... exceed maximum
+    # size" warning and the recorder silently drops the entire attributes
+    # payload (losing the small attributes too). Live state still carries
+    # ``recent_intervals`` for ApexCharts / Plotly cards — we just don't
+    # persist it to the recorder DB on every state change.
+    _unrecorded_attributes = frozenset({"recent_intervals"})
 
     def __init__(self, coordinator: SnoPUDCoordinator, account_number: str) -> None:
         super().__init__(coordinator)

@@ -128,54 +128,15 @@ It also creates one **sensor entity** per meter, named like:
 sensor.snopud_meter_1000000001_latest_15_min_usage
 ```
 
-The sensor's state is the **kWh consumed during the most recent 15-minute
-Green Button interval that the integration has seen so far** — i.e. a
-per-interval total, not a cumulative counter. Its state
-class is `measurement` (not `total_increasing`) because 15-minute interval
-kWh values naturally rise and fall with consumption; treating them as a
-monotonic meter would mis-classify every dip as a meter reset and break
-HA's statistics engine.
-
-What this sensor is good for:
-
-- **"Latest available interval" automations and display** — e.g. a card
-  that shows the most recent 15-minute kWh figure and a "data lag X min"
-  label, or an automation that triggers when the latest interval crosses
-  a threshold.
-- **As the data source for a true 15-minute bar chart** — but only via
-  the entity's `recent_intervals` attribute (see
-  [15-minute bar chart card](#15-minute-bar-chart-card-apexcharts) below),
-  not via the entity's HA state history.
-
-What this sensor is **not** good for, and why:
-
-- **Aligned 15-minute historical charts driven by the entity's HA state
-  history** (the native History Graph card, Statistics Graph, Utility
-  Meter, etc.). Because SnoPUD's portal data lags 6–8 hours behind wall
-  clock, the integration discovers multiple new 15-minute intervals at
-  once when it refreshes. HA's recorder timestamps each state update at
-  *the time HA received it*, not at the original Green Button interval
-  time. Anything that reads the entity's state history therefore sees a
-  series of stair-step jumps at the integration's poll/refresh times,
-  not bars aligned to the actual 10:45, 11:00, 11:15… usage windows.
-  The state-history-based view can still be useful for experimentation
-  and rough "is the meter alive" checks, but it should not be presented
-  to users as the accurate, source-timestamp-aligned 15-minute history —
-  it isn't, and it can't be made one through any HA-native helper that
-  consumes state history.
-- **The Energy Dashboard.** The dashboard expects a `total_increasing`
-  cumulative; this sensor is intentionally `measurement`. Always point
-  the Energy Dashboard at the hourly external statistic
-  (`snopud:energy_consumption_<account>`) — that's the canonical
-  long-term-totals feed and is unaffected by anything in the 15-minute
-  sensor's design.
-
-For a true 15-minute bar chart aligned to the original Green Button
-interval timestamps, read `attributes.recent_intervals` from a chart card
-that lets you plot each item by its own `start` value. The
-[15-minute bar chart card](#15-minute-bar-chart-card-apexcharts) section
-below shows how to do this with ApexCharts; the same approach works with
-Plotly via an equivalent `data_generator`.
+Its state is the kWh consumed during the most recent complete 15-minute
+Green Button interval — a per-interval reading, not a cumulative counter.
+Use it for "latest interval" automations and displays, and as the source
+for a true 15-minute bar chart via its `recent_intervals` attribute (see
+[15-minute bar chart card](#15-minute-bar-chart-card-apexcharts) below).
+Do **not** wire it into the Energy Dashboard or a Utility Meter helper —
+those want the hourly long-term statistic. The full rationale and the
+caveats around state-history-based charts live in [The two data
+paths](#the-two-data-paths-and-which-one-to-use-for-what).
 
 > **Upgrade note (v0.2.7).** The 15-minute sensor was redesigned in v0.2.7.
 > The old entity (`sensor.snopud_meter_<account>_energy`,
@@ -254,65 +215,40 @@ substituted for each other.
 | Semantics | cumulative `sum`, monotonic | latest available per-interval kWh, varies up and down |
 | State class | n/a (external statistic) | `measurement` |
 | Source-timestamp alignment | yes — each row is keyed on the original SnoPUD hour boundary | yes for the `recent_intervals` attribute (each item carries its original Green Button interval `start`); **no** for the entity's HA state history (HA records state at refresh time, not at the original interval time) |
-| Retained | indefinitely (long-term statistics) | rolling 7-day window in `attributes.recent_intervals` (672 buckets, persisted to disk so it survives HA restarts; backed by a 14-day on-disk archive that can survive multi-day outages); the entity's HA state history is governed by HA's recorder retention but, as noted above, it is not aligned to the original SnoPUD interval times |
+| Retained | indefinitely (long-term statistics) | rolling 7-day window in `attributes.recent_intervals` (672 buckets, marked `_unrecorded_attributes` so it lives on the live entity state but is not stored in HA's recorder; rehydrated each refresh from a 14-day on-disk JSON archive that survives HA restarts and multi-day outages); the entity's HA state history is governed by HA's recorder retention but, as noted above, it is not aligned to the original SnoPUD interval times |
 | Use it for | **Energy Dashboard**, daily/weekly/monthly/yearly totals, anything billing-shaped | "latest available 15-min interval" displays and automations; aligned 15-min bar charts via `recent_intervals` and a chart card such as ApexCharts |
 | **Do not** use it for | as a substitute for the 15-minute sensor when you want fine-grain detail | as the Energy Dashboard source; as a Utility Meter source; as the source for any "aligned 15-minute history" view via state history alone |
 
-**Don't try to use the 15-minute sensor as your Energy Dashboard source.**
-The dashboard expects a `total_increasing` cumulative; the 15-minute sensor
-is intentionally `measurement` (per-interval). Point the dashboard at the
-hourly external statistic.
+The next section explains *why* the design splits this way — both why
+the sensor is `measurement` rather than `total_increasing`, and why
+aligned 15-minute charts have to read `recent_intervals` rather than
+the entity's state history.
 
-**Don't try to derive an aligned 15-minute historical chart from the
-sensor's state history.** The state history is timestamped at integration
-refresh time, not at the original SnoPUD interval time, so cards or
-helpers that consume state history (the native History Graph, Statistics
-Graph, Utility Meter, template sensors integrating state changes, etc.)
-will not produce a chart that matches the actual usage windows. For an
-aligned 15-minute bar chart, read the `recent_intervals` attribute with a
-card that plots each item by its own `start` (see below).
+### Why the design works around SnoPUD's data lag
 
-### Why the 15-minute sensor is `measurement`, not `total_increasing`
+Two design decisions follow from one fact: SnoPUD's portal data lags
+wall clock by 6–8 hours, and a single refresh often surfaces several
+new 15-minute intervals at once (e.g. an 8 PM poll reveals
+10 AM–noon).
 
-A `total_increasing` energy sensor must rise monotonically except on a
-genuine meter reset. A 15-minute interval kWh value (e.g.
-`10:45–11:00 = 0.333 kWh`, `11:00–11:15 = 0.310 kWh`) is *not* monotonic
-— it tracks consumption during one specific 15-minute window and
-naturally goes up and down. Feeding such a series into a
-`total_increasing` sensor makes HA's statistics engine treat every dip as
-a meter reset, which produces nonsense long-term statistics.
+**Why the sensor is `measurement`, not `total_increasing`.** A
+`total_increasing` sensor must rise monotonically except on a genuine
+meter reset. A per-interval kWh series (`10:45–11:00 = 0.333`,
+`11:00–11:15 = 0.310`) naturally rises and falls — feeding it as
+`total_increasing` would have HA treat every dip as a meter reset and
+produce nonsense statistics. So the sensor is `measurement`, and the
+canonical cumulative feed is the parallel **hourly long-term
+statistic** instead.
 
-The sensor is therefore declared `measurement`, and the integration
-exposes the actual per-interval values via the `recent_intervals`
-attribute (each item carrying its original SnoPUD interval `start`/`end`)
-for aligned-time charts. Because SnoPUD data is delayed, the entity's
-normal HA state history is not the source of truth for 15-minute chart
-timing. The sensor state is useful for "latest available interval"
-automations and displays, but HA records that state when the integration
-refreshes, not when the original 15-minute usage occurred. For a true
-15-minute bar chart, use the `recent_intervals` attribute with a chart
-card that plots each item by its own `start` timestamp.
-
-For cumulative totals (daily/weekly/monthly/yearly kWh), use the hourly
-long-term statistic — see [Getting daily / weekly / monthly
-totals](#getting-daily--weekly--monthly-totals) above.
-
-### Why the SnoPUD lag doesn't break the bar chart
-
-SnoPUD's portal data typically lags wall clock by 6–8 hours. So when the
-integration polls at, say, 8:00 PM, the freshly-available export may
-contain newly-revealed 15-minute intervals stretching from 10:00 AM
-through noon — multiple new buckets at once.
-
-If we wrote those out as ordinary HA state updates, all of them would be
-recorded with timestamp `~8:00 PM` (HA's polling time), even though they
-*describe* consumption at 10:00 AM, 10:15 AM, etc. The standard HA history
-graph would draw them as a vertical step at 8 PM, not as bars across the
-late morning.
-
-The integration sidesteps this by keeping a rolling per-meter set of
-every 15-minute bucket it has seen, **keyed by the original SnoPUD
-interval start timestamp**, and exposing the whole window as
+**Why charts read `recent_intervals`, not state history.** HA's
+recorder stamps each state update at the time HA *received* it. With
+SnoPUD's lag, those timestamps are 6–8 hours after the real interval —
+several new buckets are recorded with the same poll-time stamp. A
+History Graph or Statistics Graph card therefore shows stair-step
+jumps at refresh time, not bars aligned to the actual 10:45, 11:00,
+11:15… usage windows. The integration sidesteps this by keeping a
+rolling per-meter set of every 15-minute bucket it has seen, **keyed
+by the original SnoPUD interval start**, and exposing it as
 `attributes.recent_intervals`:
 
 ```yaml
@@ -324,21 +260,21 @@ attributes:
     - start: "2026-04-28T11:00:00-07:00"
       end:   "2026-04-28T11:15:00-07:00"
       kwh:   0.310
-    - start: "2026-04-28T11:15:00-07:00"
-      end:   "2026-04-28T11:30:00-07:00"
-      kwh:   0.358
 ```
 
-Every bucket newly surfaced by the latest refresh is merged into this set
-(deduped by `start`, sorted chronologically). The most recent 672 entries
-(7 days of 15-min data) are exposed in the entity's `recent_intervals`
-attribute for the bar chart; up to 1344 entries (14 days) are kept in a
-persisted on-disk archive that survives HA restarts and integration
-reloads — see [How the persistent archive
-works](#how-the-persistent-archive-works) below. A dashboard card reads
-the attribute and plots bars at the *original* SnoPUD timestamps, not at
-HA's polling time, so the chart looks correct regardless of how laggy or
-bursty the upstream feed is.
+A chart card that positions bars by `recent_intervals[i].start`
+plots them at the actual usage time, regardless of when HA polled.
+The most recent 672 entries (7 days) are exposed in the attribute;
+up to 1344 entries (14 days) are kept in a persisted on-disk archive
+that survives HA restarts — see [How the persistent archive
+works](#how-the-persistent-archive-works) below.
+
+The native HA History Graph, Statistics Graph, Utility Meter, and any
+template sensor that integrates state changes will all show the
+shifted, blocky pattern described above — they are not bugs, they are
+state-history consumers being honest about when state arrived. They
+can be useful for "is the meter alive" liveness checks, but the
+aligned 15-minute view lives in `recent_intervals`.
 
 ### 15-minute bar chart card (ApexCharts)
 
@@ -397,32 +333,13 @@ through noon, all of those bars land in the late-morning region of the
 chart, not at 8:00 PM. The bar chart is therefore aligned to actual
 usage time, not to integration refresh time.
 
-#### Why the native HA History Graph looks blocky or shifted
-
-If you also drop a plain History Graph card on the same entity, the
-result will look very different from the ApexCharts bar chart above —
-likely as a stair-step line that jumps at each integration refresh and
-holds flat in between, with the latest interval value appearing several
-hours after the actual interval ended. That is expected. The History
-Graph card draws the entity's HA state history, which records each state
-update at the time HA received it (the integration's poll/refresh time),
-not at the original 15-minute interval time. Because SnoPUD's data lags
-6–8 hours, the History Graph view is **not** an aligned 15-minute usage
-history and should not be presented as one. The same caveat applies to
-Statistics Graph, Utility Meter, template sensors that integrate state
-changes over time, and any other helper or card that consumes the
-entity's state history. Those tools can still be useful for
-experimentation or rough liveness checks, but the only aligned
-15-minute view that this integration provides is the `recent_intervals`
-attribute via a chart that plots each item by its own `start`.
-
 ### How the persistent archive works
 
 The 15-minute interval data is held in **two tiers**:
 
 | Tier | Where | Default size | Purpose |
 |---|---|---|---|
-| Chart window | Entity attribute `recent_intervals` | 672 buckets (7 days) | What dashboard cards (ApexCharts, Plotly) plot. HA's recorder copies this attribute payload on every state change, so it's deliberately bounded. |
+| Chart window | Entity attribute `recent_intervals` | 672 buckets (7 days) | What dashboard cards (ApexCharts, Plotly) plot. The attribute is marked `_unrecorded_attributes` on the sensor class so the recorder skips it on every state change — the live state still carries the full payload for cards to read, but the recorder isn't asked to persist a ~64 KB blob on every refresh. |
 | Archive | On-disk JSON file managed by HA's `Store` helper | 1344 buckets (14 days) | Survives HA restarts, integration reloads, and HACS upgrades so the chart is populated immediately on next startup instead of needing to re-fetch a week of data from SnoPUD. |
 
 The archive is a single JSON file at
@@ -460,28 +377,33 @@ ARCHIVE_INTERVAL_LIMIT = 1344         # 14 days (on-disk archive)
 ```
 
 To change the chart window, edit `SENSOR_RECENT_INTERVAL_LIMIT`. Each
-bucket in the entity attribute is ~150 bytes; HA's recorder records the
-full attributes payload on every refresh, so doubling this constant
-doubles the recorder's per-state-change write size. The default 672 ≈
-100 KB per refresh, which is comfortable. Pushing much beyond ~30 days
-(2880) starts to noticeably inflate recorder storage.
+bucket in the entity attribute is ~95 bytes. The attribute is marked
+`_unrecorded_attributes` on the sensor class, so the recorder skips
+it on every state change — growing the chart window therefore does
+**not** inflate recorder storage. The remaining cost is the in-memory
+payload that ships with each state update to subscribed clients
+(Lovelace, websocket consumers); at the default 672 the live payload
+is ~64 KB, which is well within HA's per-state-change handling
+budget. Pushing much beyond ~30 days (2880 buckets, ~270 KB live
+payload) is feasible but starts to feel sluggish in cards that parse
+the array on every state change.
 
 To change the archive window, edit `ARCHIVE_INTERVAL_LIMIT`. The archive
 is one JSON file, not in the recorder, so this is essentially free in
-storage terms — at 14 days it's ~200 KB on disk. The archive must be ≥
-the chart window. Increasing `SENSOR_INITIAL_BACKFILL_DAYS` to match a
-larger archive size makes first-setup populate the chart with a longer
-window immediately rather than over the next several days.
+storage terms — at 14 days it's ~200 KB on disk. `const.py` raises
+`ValueError` at import time if the archive is set smaller than the
+chart window, since slicing a window larger than the trimmed archive
+would silently truncate the chart. Increasing
+`SENSOR_INITIAL_BACKFILL_DAYS` to match a larger archive size makes
+first-setup populate the chart with a longer window immediately
+rather than over the next several days.
 
-For 15-minute history beyond ~30 days, mirror the entity to an external
-timeseries store (InfluxDB, TimescaleDB) — but be aware that mirroring
-the *entity state history* inherits the same alignment caveat as the
-History Graph card (state updates are recorded at integration refresh
-time, not at the original interval time). Mirroring the
-`recent_intervals` *attribute* preserves alignment but introduces
-deduplication complexity. Most users will want to use the
-indefinitely-retained hourly long-term statistics path
-(`snopud:energy_consumption_<account>`) for long-range queries instead.
+For 15-minute history beyond ~30 days, mirror `recent_intervals` to
+an external timeseries store (InfluxDB, TimescaleDB) — mirroring the
+entity's state history inherits the same alignment caveat described
+in [the design rationale](#why-the-design-works-around-snopuds-data-lag).
+Most users will get what they need from the indefinitely-retained
+hourly long-term statistic instead.
 
 ## How it works
 
@@ -541,37 +463,17 @@ on every refresh.
   the billing-interval backfill toggle (under SnoPUD → Configure) — that
   pulls one row per billing month and reaches as far back as your account
   has billing records.
-- **Retention, in plain English.** Home Assistant keeps two kinds of
-  history, and this integration uses both:
-  1. **Long-term statistics** are kept indefinitely (they're the series
-     behind the Energy Dashboard). The integration writes the hourly feed
-     straight into LTS as `snopud:energy_consumption_<account>` (and
-     `snopud:energy_cost_<account>` when cost is available). Once imported,
-     those points are retained forever.
-  2. **Sensor state history** (the per-refresh state values of
-     `sensor.snopud_meter_<account>_latest_15_min_usage`) is kept by HA's
-     **recorder**, which by default purges state history older than
-     `purge_keep_days` (10 days). Important: this state history is
-     timestamped at integration refresh time, not at the original Green
-     Button interval time, so it is not an aligned 15-minute usage
-     history and shouldn't be presented as one (see "The two data
-     paths" above for the full explanation). The aligned 15-minute view
-     lives in the entity's `attributes.recent_intervals` array — a
-     rolling 7-day window of buckets keyed by their original SnoPUD
-     interval start timestamps, intended to be consumed by a chart card
-     such as ApexCharts. The integration also keeps a 14-day on-disk
-     archive (single JSON file via HA's `Store` helper, outside the
-     recorder DB) so the chart populates immediately after HA restarts
-     or HACS upgrades — see [How the persistent archive
-     works](#how-the-persistent-archive-works) above. For 15-minute
-     history beyond ~30 days, mirror to an external timeseries store
-     (InfluxDB, TimescaleDB, etc.); be aware that mirroring the
-     entity's state inherits the same alignment caveat as state-history
-     consumers, while mirroring `recent_intervals` preserves alignment
-     but takes more setup. The hourly long-term-statistics path is the
-     retained-forever feed and is properly time-aligned at hour grain.
-     The SnoPUD integration can't change HA's recorder retention from
-     its own config.
+- **Retention, in plain English.** Hourly long-term statistics
+  (`snopud:energy_consumption_<account>` and the optional cost series)
+  are retained indefinitely — that's the canonical feed behind the
+  Energy Dashboard. The 15-minute sensor's HA state history is bound
+  by HA's recorder (default 10 days, controlled by `purge_keep_days`,
+  not configurable from this integration); the *aligned* 15-minute
+  data lives in the entity's `recent_intervals` attribute and the
+  integration's own 14-day on-disk archive — see [How the persistent
+  archive works](#how-the-persistent-archive-works). For 15-minute
+  history beyond ~30 days, mirror `recent_intervals` to an external
+  timeseries store (InfluxDB, TimescaleDB).
 - **Max download window.** Empirical; the integration defaults to 90-day
   chunks. If you hit errors on backfill, lower `MAX_DOWNLOAD_WINDOW_DAYS` in
   `const.py`.
@@ -641,6 +543,30 @@ need the nuclear option:
   format.
 
 ## Changelog
+
+### v0.2.10 — sensor recorder fixes (post-v0.2.9 patch)
+
+Two HA log warnings surfaced after v0.2.9 raised the chart window to 7
+days; both are addressed here.
+
+* **`recent_intervals` no longer trips the recorder's 16 KB attribute
+  cap.** With 672 buckets the attribute is ~64 KB, well over HA's per-
+  state-change cap. The attribute is now marked `_unrecorded_attributes`
+  on the sensor class — it stays on the live entity state (so
+  ApexCharts / Plotly cards still see it), but the recorder skips it.
+  The other small attributes (`latest_interval_*`, `data_lag_minutes`)
+  continue to be recorded normally.
+* **Sensor no longer warns about device-class / state-class mismatch.**
+  HA's validator rejects `device_class=energy` with
+  `state_class=measurement`. Since the value is a per-interval delta
+  (not a monotonic counter), `measurement` is the honest state class
+  — so `device_class` has been dropped. No impact on the Energy
+  Dashboard (which uses the long-term statistic feed). If an
+  automation or template filtered on `device_class == 'energy'`,
+  switch to `unit_of_measurement == 'kWh'` or filter by entity ID.
+* **Defensive guard:** `const.py` raises `ValueError` at import time
+  if `ARCHIVE_INTERVAL_LIMIT < SENSOR_RECENT_INTERVAL_LIMIT`, which
+  would otherwise silently truncate the chart.
 
 ### v0.2.9 — persistent 15-minute archive, 7-day chart, smaller refresh footprint
 
