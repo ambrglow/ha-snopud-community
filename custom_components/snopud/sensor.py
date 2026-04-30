@@ -11,29 +11,42 @@ This sensor is **not** a cumulative energy counter. Its state is the kWh
 *delivered during the most recent complete 15-minute interval*, and that
 value naturally rises and falls with consumption. We therefore use:
 
-    state_class = measurement       (NOT total_increasing)
-    unit        = kWh
+    state_class  = (deliberately omitted)
     device_class = (deliberately omitted)
+    unit         = kWh
 
-A ``total_increasing`` state class would tell HA's statistics engine to
-treat the value as a meter reading that only ever resets, which is the
-opposite of what 15-minute interval consumption looks like.
+We deliberately set neither ``state_class`` nor ``device_class``:
 
-We DO NOT set ``device_class = energy``. As of HA's tightened sensor
-validation (Jan 2024), ``device_class=energy`` is incompatible with
-``state_class=measurement`` — it requires ``total_increasing`` or
-``total``. Since our value is a per-interval delta (not a monotonic
-counter), the right move is to drop the device class rather than lie
-about the semantics. The unit ``kWh`` still conveys what kind of value
-this is to dashboards and templates; only the device-class-driven
-auto-Energy-Dashboard wiring is forfeited, which is fine because the
-Energy Dashboard's canonical feed is the parallel
-``snopud:energy_consumption_<account>`` external long-term statistic
-written by ``statistics.py`` from the **hourly** Green Button export.
-That path is unaffected by anything in this file. Users who want a
-monotonic kWh counter at 15-minute grain should wrap this sensor in HA's
-built-in **Utility Meter** helper — it integrates per-interval deltas
-into a proper cumulative for them.
+* ``state_class = total_increasing`` would tell HA's statistics engine
+  to treat every dip in the per-interval kWh value as a meter reset
+  and re-sum from zero — broken arithmetic for a series that
+  legitimately rises and falls with consumption.
+* ``state_class = measurement`` would make HA's sensor recorder
+  auto-compile a long-term-statistics series for this entity (mean
+  / min / max per hour, derived from the entity's state history).
+  That auto-LTS series would be sourced from state-history rows
+  timestamped at integration refresh time rather than at the
+  original SnoPUD interval time (see SnoPUD's 6–8 h portal lag),
+  so it would be misaligned in exactly the way the History Graph
+  card already is. Worse, transient unit hiccups during HA bootstrap
+  (entity briefly unavailable, unit briefly None) would lock in a
+  unit-incompatibility warning the user has to fix manually via
+  Developer Tools → Statistics.
+* ``device_class = energy`` is incompatible with the ``measurement``
+  state class anyway under HA's post-Jan-2024 sensor validation,
+  and it would auto-wire the entity into the Energy Dashboard, which
+  is the wrong feed for this entity (the dashboard expects a
+  cumulative; this sensor is a per-interval delta).
+
+The canonical long-term statistics for this integration are written
+**externally** by ``statistics.py`` from the *hourly* Green Button feed
+into ``snopud:energy_consumption_<account>``. That path is the right
+shape for the Energy Dashboard and for daily/weekly/monthly totals,
+and it is unaffected by anything in this file.
+
+Users who want a monotonic kWh counter at 15-minute grain should wrap
+this sensor in HA's built-in **Utility Meter** helper, which
+integrates per-interval deltas into a proper cumulative.
 
 Recorder attribute size — ``recent_intervals``
 ----------------------------------------------
@@ -81,10 +94,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.components.sensor import (
-    SensorEntity,
-    SensorStateClass,
-)
+from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -116,22 +126,27 @@ class SnoPUDLatest15MinSensor(CoordinatorEntity[SnoPUDCoordinator], SensorEntity
     State semantics:
         * ``native_value`` — kWh consumed during the most recent complete
           15-minute Green Button interval. Naturally varies up and down.
-        * ``state_class`` — ``measurement`` (per-interval reading, not a
-          cumulative counter).
-        * ``device_class`` — ``energy``.
+        * ``state_class`` — deliberately omitted (see module docstring;
+          the value is a per-interval delta, not a cumulative, and
+          auto-LTS over its state history would be misaligned).
+        * ``device_class`` — deliberately omitted (incompatible with
+          measurement; auto-Energy-Dashboard wiring would be wrong).
+        * ``unit_of_measurement`` — ``kWh``.
         * Extra state attributes include the original SnoPUD interval
           timestamps and a rolling ``recent_intervals`` list intended for
           dashboard bar charts.
     """
 
     _attr_has_entity_name = True
-    # No device_class — see module docstring. ``device_class=energy`` is
-    # incompatible with ``state_class=measurement`` (HA tightened validation
-    # in Jan 2024 to require total_increasing/total for energy), and our
-    # value is a per-interval delta, not a cumulative counter, so
-    # ``measurement`` is the only honest choice.
-    # MEASUREMENT, not TOTAL_INCREASING — see module docstring for why.
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    # No state_class, no device_class — see module docstring for the full
+    # rationale. The short version: this sensor is a per-interval delta
+    # whose state history is timestamped at integration refresh time
+    # (because of SnoPUD's 6–8 h portal lag), not at the original
+    # interval time. Letting HA auto-compile long-term statistics off
+    # that misaligned history would produce a parallel low-quality LTS
+    # series that competes with the integration's own external
+    # statistic. The unit is still ``kWh`` so dashboards and templates
+    # can identify the value's shape.
     _attr_native_unit_of_measurement = STATISTIC_UNIT_KWH
     # Keep ``recent_intervals`` out of the recorder's state-attribute history.
     # The list can be ~64 KB, well over the recorder's 16 KB attribute cap;

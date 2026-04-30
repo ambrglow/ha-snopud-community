@@ -188,11 +188,12 @@ templating or notifications), Home Assistant's built-in **Utility Meter**
 helper can produce them.
 
 A Utility Meter helper requires a `total_increasing` source sensor. The
-15-minute sensor in this integration is `measurement`, not
-`total_increasing`, so it is **not** a valid Utility Meter source. A
-common workaround in other integrations is to use the long-term statistic
-via the *Statistic-based template* path, but the cleanest approach here
-is just to read totals straight off the Energy Dashboard, which is fed by
+15-minute sensor in this integration deliberately exposes no
+`state_class` (see [the design rationale](#why-the-design-works-around-snopuds-data-lag)),
+so it is **not** a valid Utility Meter source. A common workaround in
+other integrations is to use the long-term statistic via the
+*Statistic-based template* path, but the cleanest approach here is
+just to read totals straight off the Energy Dashboard, which is fed by
 the same statistic.
 
 Do not configure a Utility Meter against the 15-minute sensor expecting
@@ -213,14 +214,14 @@ substituted for each other.
 | Statistic / entity | `snopud:energy_consumption_<account>` | `sensor.snopud_meter_<account>_latest_15_min_usage` |
 | Granularity | 1 hour | 15 minutes |
 | Semantics | cumulative `sum`, monotonic | latest available per-interval kWh, varies up and down |
-| State class | n/a (external statistic) | `measurement` |
+| State class | n/a (external statistic) | (none — see rationale below) |
 | Source-timestamp alignment | yes — each row is keyed on the original SnoPUD hour boundary | yes for the `recent_intervals` attribute (each item carries its original Green Button interval `start`); **no** for the entity's HA state history (HA records state at refresh time, not at the original interval time) |
 | Retained | indefinitely (long-term statistics) | rolling 7-day window in `attributes.recent_intervals` (672 buckets, marked `_unrecorded_attributes` so it lives on the live entity state but is not stored in HA's recorder; rehydrated each refresh from a 14-day on-disk JSON archive that survives HA restarts and multi-day outages); the entity's HA state history is governed by HA's recorder retention but, as noted above, it is not aligned to the original SnoPUD interval times |
 | Use it for | **Energy Dashboard**, daily/weekly/monthly/yearly totals, anything billing-shaped | "latest available 15-min interval" displays and automations; aligned 15-min bar charts via `recent_intervals` and a chart card such as ApexCharts |
 | **Do not** use it for | as a substitute for the 15-minute sensor when you want fine-grain detail | as the Energy Dashboard source; as a Utility Meter source; as the source for any "aligned 15-minute history" view via state history alone |
 
 The next section explains *why* the design splits this way — both why
-the sensor is `measurement` rather than `total_increasing`, and why
+the sensor exposes no `state_class` or `device_class` at all, and why
 aligned 15-minute charts have to read `recent_intervals` rather than
 the entity's state history.
 
@@ -231,14 +232,33 @@ wall clock by 6–8 hours, and a single refresh often surfaces several
 new 15-minute intervals at once (e.g. an 8 PM poll reveals
 10 AM–noon).
 
-**Why the sensor is `measurement`, not `total_increasing`.** A
-`total_increasing` sensor must rise monotonically except on a genuine
-meter reset. A per-interval kWh series (`10:45–11:00 = 0.333`,
-`11:00–11:15 = 0.310`) naturally rises and falls — feeding it as
-`total_increasing` would have HA treat every dip as a meter reset and
-produce nonsense statistics. So the sensor is `measurement`, and the
-canonical cumulative feed is the parallel **hourly long-term
-statistic** instead.
+**Why the sensor exposes no `state_class` or `device_class`.** Neither
+of HA's available choices fits a per-interval delta:
+
+* `total_increasing` would tell HA's statistics engine to treat every
+  dip in the per-interval kWh value as a meter reset — broken
+  arithmetic for a series that legitimately rises and falls.
+* `measurement` would tell HA to auto-compile a parallel
+  long-term-statistics series (mean / min / max per hour) from the
+  entity's state history. But the entity's state history is
+  timestamped at *integration refresh time*, not at the original
+  SnoPUD interval time, so that auto-LTS series would be misaligned
+  in exactly the same way the History Graph card is — and it would
+  compete with the integration's own properly-aligned external
+  statistic. Worse, transient unit hiccups during HA bootstrap
+  (entity briefly unavailable, unit briefly None) lock in a unit-
+  incompatibility warning the user has to fix manually via Developer
+  Tools → Statistics.
+* `device_class = energy` is incompatible with `measurement` under
+  HA's post-Jan-2024 sensor validation, and would auto-wire the
+  entity into the Energy Dashboard, which expects a cumulative.
+
+The integration writes its own external long-term statistic
+(`snopud:energy_consumption_<account>`) from the *hourly* Green Button
+feed — that's the canonical cumulative for the Energy Dashboard and
+all daily/weekly/monthly totals. The 15-minute sensor stays out of
+HA's auto-LTS pipeline so there's exactly one LTS series, properly
+aligned, per meter.
 
 **Why charts read `recent_intervals`, not state history.** HA's
 recorder stamps each state update at the time HA *received* it. With
@@ -543,6 +563,48 @@ need the nuclear option:
   format.
 
 ## Changelog
+
+### v0.2.11 — drop sensor `state_class` to suppress conflicting auto-LTS
+
+Follow-up to v0.2.10. After dropping `device_class=energy`, HA's
+sensor recorder began auto-compiling a long-term-statistics series
+from the 15-minute sensor's state history (because the entity still
+had `state_class=measurement` and a unit). That auto-LTS competed
+with the integration's own external statistic and produced a
+"unit cannot be converted to the unit of previously compiled
+statistics" warning whenever a transient bootstrap state had left
+the auto-LTS rows tagged with a different unit (or `None`).
+
+**Fix:** the 15-minute sensor now exposes neither `state_class` nor
+`device_class`. The unit is still `kWh`. HA's recorder no longer
+auto-compiles LTS for this entity, so there is exactly one LTS
+series per meter — the integration's own
+`snopud:energy_consumption_<account>` external statistic, written
+from the hourly Green Button feed. See [Why the design works around
+SnoPUD's data lag](#why-the-design-works-around-snopuds-data-lag)
+for the full reasoning.
+
+**One-time cleanup after upgrading** (only if you saw the
+"unit cannot be converted…" warning before upgrading): open
+**Developer Tools → Statistics** in Home Assistant. Find the row
+for `sensor.snopud_meter_<account>_latest_15_min_usage` flagged
+with a unit issue and click **Fix issue → Delete**. This removes
+the orphaned auto-LTS rows; nothing important is lost because the
+canonical feed lives at `snopud:energy_consumption_<account>`,
+which is unaffected. Fresh installs see no orphaned rows and need
+no cleanup.
+
+**No impact on:**
+
+* The Energy Dashboard — uses the external statistic, unchanged.
+* The 15-minute bar chart card — reads `recent_intervals`, unchanged.
+* Automations and templates that read the sensor's current state —
+  the value, unit, and entity ID are all unchanged.
+
+If a Utility Meter helper was wired against this sensor, it has not
+been a valid source since v0.2.10 (the integration warned about
+this) and will need to be replaced with a Statistic-based template
+against the long-term statistic, or removed.
 
 ### v0.2.10 — sensor recorder fixes (post-v0.2.9 patch)
 

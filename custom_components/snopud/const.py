@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 DOMAIN = "snopud"
-VERSION = "0.2.10"
+VERSION = "0.2.11"
 
 # Integration config keys (entry.data)
 CONF_EMAIL = "email"
