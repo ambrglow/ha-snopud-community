@@ -122,6 +122,11 @@ Go to **Settings → Dashboards → Energy** and add the energy series as a grid
 consumption source; add the cost series under "Costs" if you want the dollar
 view.
 
+For Home Assistant 2026.11 Recorder compatibility, energy statistics explicitly
+declare the energy unit class; USD cost statistics explicitly declare no unit
+class (Recorder does not convert currencies). Statistic IDs and recorded values
+are unchanged; no statistics migration is needed for this metadata change.
+
 It also creates one **sensor entity** per meter, named like:
 
 ```

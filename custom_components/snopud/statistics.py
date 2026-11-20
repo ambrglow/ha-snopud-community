@@ -36,6 +36,7 @@ from homeassistant.components.recorder.statistics import (
 )
 from homeassistant.components.recorder.util import get_instance
 from homeassistant.core import HomeAssistant
+from homeassistant.util.unit_conversion import EnergyConverter
 
 # ``StatisticMeanType`` was introduced alongside the recorder statistics
 # metadata refresh. Older HA releases don't have it; emitting metadata
@@ -60,6 +61,8 @@ def _stat_metadata(*, statistic_id: str, name: str, unit: str) -> dict:
     we set ``mean_type`` in exactly one place. We use
     ``StatisticMeanType.NONE`` because both series are sum-only
     (``has_mean=False``); no arithmetic average is computed for them.
+    Energy declares its conversion class; USD explicitly has no unit class
+    because Recorder does not provide currency conversion.
 
     On HA cores that predate ``StatisticMeanType``, the ``mean_type`` key is
     omitted entirely — the recorder ignores unknown keys, and ``has_mean``
@@ -71,6 +74,7 @@ def _stat_metadata(*, statistic_id: str, name: str, unit: str) -> dict:
         "name": name,
         "source": DOMAIN,
         "statistic_id": statistic_id,
+        "unit_class": EnergyConverter.UNIT_CLASS if unit == STATISTIC_UNIT_KWH else None,
         "unit_of_measurement": unit,
     }
     if _STATISTIC_MEAN_TYPE_NONE is not None:
