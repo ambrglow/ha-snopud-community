@@ -12,6 +12,8 @@ Home Assistant's recorder is stubbed in-memory: ``async_add_external_statistics`
 is captured into a per-statistic_id history, and ``get_last_statistics`` /
 ``statistics_during_period`` read from that history. This lets us verify the
 exact payloads and the running cumulative sums they carry.
+Metadata is copied at the import boundary, before Recorder could infer missing
+fields, so these tests also detect external-statistics API regressions.
 """
 from __future__ import annotations
 
@@ -20,7 +22,9 @@ import importlib.util
 import sys
 import types
 from datetime import datetime, timedelta, timezone
+from enum import IntEnum
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -67,6 +71,7 @@ recorder_util = types.ModuleType("homeassistant.components.recorder.util")
 
 # Shared in-memory recorder: { statistic_id: [ {start, state, sum}, ... ] }.
 _RECORDER: dict[str, list[dict]] = {}
+_IMPORTS: list[tuple[dict, list[dict]]] = []
 
 
 def _get_last_statistics(hass, count, statistic_id, convert_units, types_):
@@ -93,6 +98,7 @@ def _statistics_during_period(
 
 
 def _async_add_external_statistics(hass, metadata, payload):
+    _IMPORTS.append((dict(metadata), [dict(row) for row in payload]))
     sid = metadata["statistic_id"]
     existing = _RECORDER.setdefault(sid, [])
     existing_by_start = {r["start"]: r for r in existing}
@@ -129,6 +135,19 @@ class _HomeAssistant:
 core.HomeAssistant = _HomeAssistant
 sys.modules["homeassistant.core"] = core
 
+util = types.ModuleType("homeassistant.util")
+util.__path__ = []
+sys.modules["homeassistant.util"] = util
+unit_conversion = types.ModuleType("homeassistant.util.unit_conversion")
+
+
+class _EnergyConverter:
+    UNIT_CLASS = "energy"
+
+
+unit_conversion.EnergyConverter = _EnergyConverter
+sys.modules["homeassistant.util.unit_conversion"] = unit_conversion
+
 
 # --- MeterInfo stub ----------------------------------------------------------
 
@@ -154,6 +173,32 @@ stats_mod = _load(
 
 def _reset_recorder() -> None:
     _RECORDER.clear()
+    _IMPORTS.clear()
+
+
+def _assert_metadata(
+    account: str, *, has_cost: bool, has_energy: bool = True, mean_type=None,
+) -> None:
+    expected_ids = set()
+    if has_energy:
+        expected_ids.add(f"snopud:energy_consumption_{account}")
+    if has_cost:
+        expected_ids.add(f"snopud:energy_cost_{account}")
+    assert {metadata["statistic_id"] for metadata, _ in _IMPORTS} == expected_ids
+    for metadata, _ in _IMPORTS:
+        is_energy = metadata["statistic_id"] == f"snopud:energy_consumption_{account}"
+        expected = {
+            "has_mean": False,
+            "has_sum": True,
+            "name": f"SnoPUD Meter {account} — {'Energy' if is_energy else 'Cost'}",
+            "source": "snopud",
+            "statistic_id": metadata["statistic_id"],
+            "unit_of_measurement": "kWh" if is_energy else "USD",
+            "unit_class": _EnergyConverter.UNIT_CLASS if is_energy else None,
+        }
+        if mean_type is not None:
+            expected["mean_type"] = mean_type
+        assert metadata == expected
 
 
 def _reading(dt: datetime, wh: int = 1000, cost_cents: int | None = None):
@@ -200,6 +245,7 @@ def test_pure_append_fast_path() -> None:
     assert rows[1]["sum"] == 1000.5
     assert rows[2]["start"] == _hour(16)
     assert rows[2]["sum"] == 1001.0
+    _assert_metadata("ACCT1", has_cost=False)
     print("✓ pure-append path preserves cumulative continuity")
 
 
@@ -242,6 +288,16 @@ def test_overlap_correction_rewrites_prior_value() -> None:
     # 16:00 appended on top: 4 + 1 = 5.
     assert rows[2]["state"] == 1.0
     assert rows[2]["sum"] == 5.0
+    _assert_metadata("ACCT2", has_cost=False)
+    _IMPORTS.clear()
+    _run(stats_mod.async_import_readings(
+        hass=None, entry_id="x", meter=meter, readings=new_readings,
+    ))
+    assert _IMPORTS == []
+    assert sorted(
+        _RECORDER["snopud:energy_consumption_ACCT2"],
+        key=lambda r: r["start"],
+    ) == rows
     print("✓ overlap correction rewrites stale values and recomputes sums")
 
 
@@ -298,7 +354,100 @@ def test_overlap_cost_correction() -> None:
         f"expected cost revised to 0.25, got {cost_rows[0]['state']}"
     )
     assert cost_rows[0]["sum"] == 0.25
+    _assert_metadata("ACCT4", has_cost=True, has_energy=False)
     print("✓ cost-series overlap corrections land correctly")
+
+
+def test_append_metadata_and_zero_cost_for_old_and_modern_cores() -> None:
+    """Both metadata import branches preserve USD, zero costs and payloads."""
+    class StatisticMeanType(IntEnum):
+        NONE = 0
+
+    models = types.ModuleType("homeassistant.components.recorder.models.statistics")
+    models.StatisticMeanType = StatisticMeanType
+    module_name = "custom_components.snopud._statistics_compat"
+    for model_module in (None, models):
+        with patch.dict(sys.modules, {
+            "homeassistant.components.recorder.models.statistics": model_module,
+        }):
+            module = _load(
+                module_name, ROOT / "custom_components/snopud/statistics.py",
+            )
+        _reset_recorder()
+        readings = [
+            _reading(_hour(14), wh=1000, cost_cents=25),
+            _reading(_hour(15), wh=500, cost_cents=0),
+            _reading(_hour(16), wh=500),
+        ]
+        _run(module.async_import_readings(
+            hass=None, entry_id="x", meter=_MeterInfo("COMPAT"), readings=readings,
+        ))
+        mean_type = StatisticMeanType.NONE if model_module is not None else None
+        _assert_metadata("COMPAT", has_cost=True, mean_type=mean_type)
+        assert _IMPORTS[0][1] == [
+            {"start": _hour(14), "state": 1.0, "sum": 1.0},
+            {"start": _hour(15), "state": 0.5, "sum": 1.5},
+            {"start": _hour(16), "state": 0.5, "sum": 2.0},
+        ]
+        assert _IMPORTS[1][1] == [
+            {"start": _hour(14), "state": 0.25, "sum": 0.25},
+            {"start": _hour(15), "state": 0.0, "sum": 0.25},
+        ]
+        _IMPORTS.clear()
+        _run(module.async_import_readings(
+            hass=None, entry_id="x", meter=_MeterInfo("COMPAT"), readings=readings,
+        ))
+        assert _IMPORTS == []
+        _run(module.async_import_readings(
+            hass=None, entry_id="x", meter=_MeterInfo("COMPAT"),
+            readings=[_reading(_hour(14), wh=2000, cost_cents=50)],
+        ))
+        _assert_metadata("COMPAT", has_cost=True, mean_type=mean_type)
+        assert _IMPORTS[0][1] == [
+            {"start": _hour(14), "state": 2.0, "sum": 2.0},
+            {"start": _hour(15), "state": 0.5, "sum": 2.5},
+            {"start": _hour(16), "state": 0.5, "sum": 3.0},
+        ]
+        assert _IMPORTS[1][1] == [
+            {"start": _hour(14), "state": 0.5, "sum": 0.5},
+            {"start": _hour(15), "state": 0.0, "sum": 0.5},
+        ]
+
+
+def test_billing_metadata_payloads_and_replay() -> None:
+    """Billing fills gaps without replacing hourly energy or monetary values."""
+    _reset_recorder()
+    meter = _MeterInfo("BILLING")
+    _RECORDER["snopud:energy_consumption_BILLING"] = [
+        {"start": _hour(16), "state": 0.5, "sum": 0.5},
+    ]
+    _RECORDER["snopud:energy_cost_BILLING"] = [
+        {"start": _hour(16), "state": 0.25, "sum": 0.25},
+    ]
+    readings = [
+        _reading(_hour(14), wh=1000, cost_cents=50),
+        _reading(_hour(15), wh=500, cost_cents=0),
+        _reading(_hour(16), wh=999_000, cost_cents=999),
+    ]
+    assert _run(stats_mod.async_import_billing_supplement(
+        hass=None, meter=meter, readings=readings,
+    )) == 2
+    _assert_metadata("BILLING", has_cost=True)
+    assert _IMPORTS[0][1] == [
+        {"start": _hour(14), "state": 1.0, "sum": 1.0},
+        {"start": _hour(15), "state": 0.5, "sum": 1.5},
+        {"start": _hour(16), "state": 0.5, "sum": 2.0},
+    ]
+    assert _IMPORTS[1][1] == [
+        {"start": _hour(14), "state": 0.5, "sum": 0.5},
+        {"start": _hour(15), "state": 0.0, "sum": 0.5},
+        {"start": _hour(16), "state": 0.25, "sum": 0.75},
+    ]
+    _IMPORTS.clear()
+    assert _run(stats_mod.async_import_billing_supplement(
+        hass=None, meter=meter, readings=readings,
+    )) == 0
+    assert _IMPORTS == []
 
 
 if __name__ == "__main__":
@@ -306,4 +455,6 @@ if __name__ == "__main__":
     test_overlap_correction_rewrites_prior_value()
     test_billing_supplement_preserves_existing_on_collision()
     test_overlap_cost_correction()
+    test_append_metadata_and_zero_cost_for_old_and_modern_cores()
+    test_billing_metadata_payloads_and_replay()
     print("\nall statistics tests passed")
